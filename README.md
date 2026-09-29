@@ -78,6 +78,8 @@ sysmod/
   src/fs_codepage.h      API
   src/patch_types.h      pattern/patch 基元（自 sys-patch fork 原样复制）
   tools/check_patch_sizes.py  构建期守卫（原样复制）
+doc/                     设计文档与逆向结论（不参与构建），索引 doc/README.md
+scripts/                 离线工具：固件审计等（不参与构建，需时手动跑）
 ```
 
 `fs_codepage.*` / `patch_types.h` / `check_patch_sizes.py` 与 sys-patch fork
@@ -85,18 +87,22 @@ sysmod/
 
 ## 文档与历史（2026-09-29 从 sys-patch 迁来，本工程单独维护）
 
-设计文档、逆向笔记、离线工具和逐日工作日志已随代码一起迁到本工程，
-`D:/Design/NS/sys-patch` 保持原样、**今后不再同步**：
+文档与逐日工作日志已随代码迁到本工程并整理过一遍，`D:/Design/NS/sys-patch` 保持原样、
+**今后不再同步**。整理口径：**只保留最终设计思路与原理**，过程性论证（演进史全文、
+逐轮 Ghidra 笔记、事故复盘、退役脚本）已删除，其结论并入保留文档 —— 原始过程仍可从本仓库
+git 历史（提交 `eff8a96`）或 sys-patch 的 `dev/fs-codepage` 分支查到。
 
 ```
-AGENTS.md                       智能体入口：硬不变量 / 构建 / 布局 / 文档地图
-补丁点合并优化分析.md            设计现状 + 决策台账
-M6_Ghidra反编译报告.md           M6 三个形状的 Ghidra 反编译全文
-plan.md                          CP932 ↔ UTF-8 接口级对照
-fs_encode_fix/                   RE 文档 + 离线工具（索引见 fs_encode_fix/README.md，L0–L5）
-.workbuddy/memory/               逐日工作日志（13~29 日）+ MEMORY.md 长期备忘
+AGENTS.md              智能体入口：硬不变量 / 构建 / 布局 / 文档地图
+doc/README.md          文档索引（先读它）
+doc/patch-design.md    ★ 权威：原理 + 实现 + 守卫 + 排障
+doc/design-decisions.md  设计现状 + 决策台账
+doc/fw-compat.md       版本兼容选型 + 固件审计工具用法
+doc/{fs-object-model,interface-map,encoding-choice,replace-fn-eval,test-plan}.md
+doc/{callback-tables.md,fs_structs.h}   参考数据
+scripts/               离线工具（fs_fw_audit.py / _fs_dis.py / _dump_blobs.py / _name_collision_check.py）
+.workbuddy/memory/     逐日工作日志（13~29 日）+ MEMORY.md 长期备忘
 ```
 
-- 文档里的路径已按本工程校正（离线工具读 `sysmod/fs-codepage.elf`、
-  `sysmod/src/fs_codepage.cpp`）。
+- 离线工具的默认路径已按本工程校正（读 `sysmod/fs-codepage.elf`、`sysmod/src/fs_codepage.cpp`）。
 - 26 份固件语料与离线验证脚本（`D:/Game/NS/firmware/_audit/`）体积过大，**仍在仓库外**。

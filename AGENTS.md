@@ -15,8 +15,8 @@ UTF-8 <-> UTF-16，让 FAT/exFAT 卷支持中文等 3 字节 UTF-8 文件名。C
   - `tools/check_patch_sizes.py` —— 构建期守卫。
   - `fs-codepage.json`（NPDM）/ `toolbox.json` / `Makefile`（`TARGET=fs-codepage`、`TITLE_ID`）。
 - `common/minIni/` — INI 库（与 sys-patch 同源）。
-- `fs_encode_fix/` — 逆向笔记 / 设计文档 / 离线工具（**文档，不参与构建**），索引见其 `README.md`。
-  根目录另有 `补丁点合并优化分析.md`（设计现状 + 决策台账）、`M6_Ghidra反编译报告.md`、`plan.md`。
+- `doc/` — 设计文档 / 逆向结论（**不参与构建**），索引 `doc/README.md`。
+- `scripts/` — 离线工具（固件审计、反汇编、重名检查），**不参与构建**，需时手动跑。
 - `.workbuddy/memory/` — 逐日工作日志 + `MEMORY.md`（长期备忘，先读它）。
 - 运行时配置 `/config/fs-codepage/config.ini`，日志 `/config/fs-codepage/log.ini`。
 
@@ -56,8 +56,13 @@ UTF-8 <-> UTF-16，让 FAT/exFAT 卷支持中文等 3 字节 UTF-8 文件名。C
 | 要什么 | 读哪 |
 |---|---|
 | 功能/配置/构建/共存 | `README.md` |
-| 方案与实现的唯一权威 | `fs_encode_fix/re_utf8_patch_final.md` |
-| 文档层级 L0–L5 | `fs_encode_fix/README.md` |
-| 设计现状 + 决策台账 | `补丁点合并优化分析.md` |
-| 演进史（裸写 `§N` 指它） | `fs_encode_fix/补丁点合并优化分析·演进史.md` |
-| 硬约束速查 + 坑 | `.workbuddy/memory/MEMORY.md` |
+| 文档索引（先读它定方向） | `doc/README.md` |
+| 方案与实现的唯一权威 | `doc/patch-design.md` |
+| 设计现状 + 决策台账 | `doc/design-decisions.md` |
+| 版本兼容选型 + 固件审计工具用法 | `doc/fw-compat.md` |
+| 离线工具 | `scripts/`（见 `doc/README.md` 末节） |
+| 硬约束速查 + 环境坑 | `.workbuddy/memory/MEMORY.md` |
+
+过程性历史（演进史全文、逐轮 Ghidra 笔记、事故复盘、退役脚本归档）已于 2026-09-29 删除，
+只保留最终设计思路与原理；原始过程见 git 历史提交 `eff8a96`，或 `D:/Design/NS/sys-patch`
+的 `dev/fs-codepage` 分支。

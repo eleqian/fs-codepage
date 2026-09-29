@@ -279,7 +279,7 @@ orig  vs  替换体
 
 - `sysmod/tools/check_patch_sizes.py`：`PAT_RE`/`BLOB_RE` 去掉 stage 段；删 `STAGE_IDX_MAX` 与两处范围检查；
   新增 `delta == hole` ⇒ `ZERO SLACK` 告警（warn，不 fail）。
-- `fs_encode_fix/fs_fw_audit.py`：`FS_PAT_RE`/`FS_BLOB_RE` 同步；`stage_labels()` → `group_labels()`，
+- `scripts/fs_fw_audit.py`：`FS_PAT_RE`/`FS_BLOB_RE` 同步；`stage_labels()` → `group_labels()`，
   site dict 的 `stage` 键 → `group`（它本来就是**函数组名**，与门控无关）；
   `STAGE_LIMIT_RE` 删除（指向已不存在的 `fs_stage_limit`）。实测新表解析 31 条不漏（19.0.1 命中 14 = 7+7）。
 - `_audit/_verify_cpp_table.py` / `_p1_sim_scan.py` / `_opt_equiv.py` **不受影响** —— 它们从

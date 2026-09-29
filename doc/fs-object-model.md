@@ -5,7 +5,7 @@
 > 本文档是 12 轮逆向分析的整理版，**只保留经机器码验证的正确结论**；历史草稿中的误判见 §0，不再散落在正文。
 > 结构体/偏移的权威来源是同目录 **`fs_structs.h`**（packed + `_Static_assert` 全部通过）；
 > Ghidra 数据库（FS_1/19.exfat.FS.kip1）已与头文件同步（2026-09-14 复核，含指针宽度修复）。
-> 原始遍历数据（476 个 GOT 虚表槽清单）见 `callback_tables.md`；补丁上机测试步骤见 `fs_encode_fix_test_plan.md`。
+> 原始遍历数据（476 个 GOT 虚表槽清单）见 `callback-tables.md`；补丁上机测试步骤见 `test-plan.md`。
 
 ---
 
@@ -26,7 +26,7 @@
 | `FatFileContext.bSectorShift` 是簇 shift | 是**扇区** shift（`bytesPerSectorShift - 5`） | 第三轮 |
 | demangler 结构（FsDirInfoExt、FsObject_demangler、FatFileContext_demangler、FsDirInfoObj_demangler 等） | 偏移全部不可信，已被重建结构替代，仅存于 Ghidra 未清理引用处 | 第一~三轮 |
 
-另：本工程（fs_encode_fix）历史上修过 Ghidra 侧两处结构体缺陷——`FsDrvObject.pDir_object_array`(+0x88)
+另：本工程（fs-codepage）历史上修过 Ghidra 侧两处结构体缺陷——`FsDrvObject.pDir_object_array`(+0x88)
 曾被改成 4 字节宽度（2026-09-14 复核修复为 8 字节 `FatDirObject *`）；FatDirObject 曾因 `void*`
 字段与相邻字段重叠（第十轮修复为 qword）。
 
@@ -569,8 +569,8 @@ FsObject 缓冲派生，创建与打开自洽；互操作残余风险仅无效 U
 ③ R4 逐字符或 ASCII-only；⑥ R6 补 NUL；⑦ R7 对齐续字节语义。
 完整方案见早期记录与 `sysmod/src/main.cpp` 现行实现。
 
-**2026-09-14 实施记录**（详见 `re_improve_plan.md` 末尾实施状态）：R7/R6/R5/H1/R4/R1×3/R2 已全部
-落入 main.cpp 并编译验证（函数尺寸经 nm 实测）；R3 复核为误报无需补丁。
+**实施状态**（早期改进清单 R7/R6/R5/H1/R4/R1×3/R2，该清单已随过程文档删除）：
+全部已落入补丁实现并编译验证（函数尺寸经 nm 实测）；R3 复核为误报无需补丁。
 
 ---
 

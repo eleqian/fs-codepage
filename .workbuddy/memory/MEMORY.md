@@ -8,9 +8,10 @@
   `sysmod/tools/check_patch_sizes.py` 四文件**原样复制**自 sys-patch fork
   （`D:/Design/NS/sys-patch`，全量分支 `dev/fs-codepage` / master 单点提交 `6db363f`）；
   `sysmod/src/main.cpp` 是本工程新写的骨架（退避重试 + 独立 config/log）。
-- **文档与历史已迁来（2026-09-29，原工程保持不变、今后不再同步）**：`fs_encode_fix/`（RE 文档 +
-  离线工具 + `_archive`）、`补丁点合并优化分析.md`、`M6_Ghidra反编译报告.md`、`plan.md`、
-  `.workbuddy/memory/2026-09-1x~29.md`。两个离线工具的默认 ELF/源码路径已改成本工程。
+- **文档与历史已迁来并整理（2026-09-29，原工程保持不变、今后不再同步）**：文档入 `doc/`、
+  工具入 `scripts/`；**只保留最终设计思路与原理**，过程性历史（演进史全文、逐轮 Ghidra 笔记、
+  已实施的改进清单、事故 post-mortem、退役脚本归档）已删 —— 原始过程仍在本仓库 git 历史
+  （`eff8a96`）或 sys-patch 的 `dev/fs-codepage` 分支。两个离线工具默认路径已改成本工程。
 - ★ 共存关键：fs 调试器（`svcDebugActiveProcess`）互斥 ⇒ main 里退避重试（25×200ms），
   判据 = `fs_codepage_patch_result=="start"`（可安全重跑，入口重置全部状态）；
   站点与 upstream fs 条目函数级不相交。**fork sys-patch + 本模块并存须二选一**（sys-patch 侧 `fs_codepage=0`）。
@@ -43,7 +44,7 @@
   `strb wT,[x1]`+`strb wzr,[x1,#1]`）。
 - ★ ASCII 折叠 `+0xffe0` 是旧 15 点补丁的 bug：原版比较是 16 位（`uxth`）丢进位 ⇒ 等价 `c-0x20`；
   M6 统一 `fold_ascii_upper(c)=c-0x20`（`0x31C`→`0x308`）。
-- ★ 改 fs 表的连带清单（漏一个就静默失效）：`check_patch_sizes.py` + `fs_encode_fix/fs_fw_audit.py`
+- ★ 改 fs 表的连带清单（漏一个就静默失效）：`check_patch_sizes.py` + `scripts/fs_fw_audit.py`
   （`FS_PAT_RE`/`FS_BLOB_RE`）。
 - ★★ 名字正则的字符类必须放宽：条目名含 `. + - ,` ⇒ 用 `([A-Za-z0-9_.,+-]+)`，用 `\w+` 会解析成 0 条。
 - 调试：`svcDebugActiveProcess()` 后 fs 挂起、禁写 log.ini；逃生只有 `[options] fs_codepage=0`。
@@ -68,10 +69,13 @@
 - `_dump_blobs.py` 读本工程 `sysmod/fs-codepage.elf`（已从 sys-patch.elf 改过）。
 
 ## 文档地图（本工程内）
-- 入口 `README.md`（用户向）/ `AGENTS.md`（规则约束/硬不变量/布局/文档地图）。
-- **权威实现** `fs_encode_fix/re_utf8_patch_final.md`（§3.5=M6/§3.6=M8）+ 索引 `fs_encode_fix/README.md`（L0–L5）。
-- **设计现状＋决策台账** `补丁点合并优化分析.md`（无编号）；**演进史** `fs_encode_fix/补丁点合并优化分析·演进史.md`
-  （★ 全项目裸写的 `§N` 一律指它，节号稳定）；评估报告 `fs_encode_fix/re_整函数替换功能评估.md`（§7=整改）。
+- 入口 `README.md`（用户向）/ `AGENTS.md`（规则约束/硬不变量/布局/文档地图）/ `doc/README.md`（文档索引）。
+- **权威实现** `doc/patch-design.md`（§3.5=M6/§3.6=M8）。
+- **设计现状＋决策台账** `doc/design-decisions.md`（无编号）；**版本兼容选型** `doc/fw-compat.md`；
+  **替换体评估** `doc/replace-fn-eval.md`（§7=整改）；**对象模型** `doc/fs-object-model.md`；
+  **接口对照** `doc/interface-map.md`；**测试 SOP** `doc/test-plan.md`；参考数据 `doc/callback-tables.md`
+  + `doc/fs_structs.h`。工具：`scripts/{fs_fw_audit,_fs_dis,_dump_blobs,_name_collision_check}.py`。
+- ★ 过程性历史已删 ⇒ 现在文档里的 `§N` 一律指**该文档自身**的章节（旧约定「裸 §N 指演进史」作废）。
 
 ## 迁来的日志索引（`.workbuddy/memory/`）
 | 文件 | 内容 |
@@ -82,4 +86,7 @@
 | 2026-09-17 / 18 | 版本兼容选型、跨版本固件审计（prod.keys 坑、argparse 全局参数坑） |
 | 2026-09-19 / 20 | `+0xffe0` 折叠陷阱、整函数替换评估、守卫整改 |
 | 2026-09-27 / 28 | sys-patch 仓库重排、fs 表适配上游 `..` 通配写法（两份 str2hex 合并） |
-| 2026-09-29 | 拆出本工程 + 2026-09-29 晚文档/历史迁移 |
+| 2026-09-29 | 拆出本工程 + 文档/历史迁移 + 整理（doc/ + scripts/，删过程性历史）与初始提交 |
+
+> 日志里的 `fs_encode_fix/...` 旧路径按下表换算：`fs_encode_fix/*.md` → `doc/`（文件名已改英文名，
+> 见 `doc/README.md`）、`fs_encode_fix/*.py` → `scripts/`；`sys-patch.elf` → `fs-codepage.elf`。

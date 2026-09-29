@@ -12,8 +12,8 @@
 > - 七个整函数替换（§3.5 / §3.6 与 §2.1）已取代原先的逐指令写法。
 > - 扫描侧有三项由数据推导的优化（族内互斥兄弟退役 / 全族落定空转退出 / blob 车道快筛），
 >   等价性由 `_audit/_opt_equiv.py` 在 26 份固件上逐条验证。
-> - **为什么**是这样、以及过程中被推翻的结论，全在 `补丁点合并优化分析·演进史.md`（§1–§20）；
->   设计现状速查见 `../补丁点合并优化分析.md`。
+> - 过程中被推翻的结论已随过程文档删除（2026-09-29 整理）；
+>   设计现状与决策台账见 `../design-decisions.md`。
 
 ---
 
@@ -201,7 +201,7 @@ ldr  x3, [x3, #<off>]  ; → 代码页上下文指针
 - **定位**：四条**入口对齐**模板（`fs_cp_widechar_compare_{17.0.0+,16.1.0,14.1.2,15.0.1}`，20 / 2 / 2 / 2 份），
   入口 = 实测 `0xF4770`。**不依赖任何版本偏移。**
 - **尺寸**：`0x308`（776 B），洞 `0x360`（864 B）—— 余量 88 B（用 `_dump_blobs.py` 查看字节分布）。
-- 细节与实施记录：`补丁点合并优化分析·演进史.md` §13 / §16 / §20。
+- 细节见本节上文；实施过程记录已随过程文档删除。
 
 ### 3.6 M8（`patch_fat_getnextchar`）—— 第二个「整函数替换」
 
@@ -297,7 +297,7 @@ FAT32 建 CJK 名会在 `FAT_MakeShortName` 的 `subs w23,w23,#2` 上死循环�
    （数据丢失级风险）；创建时也可能被判为"已存在"。
 
    **规避（立即可用，零风险）**：
-   - 工具 `fs_encode_fix/_name_collision_check.py`：扫描目录，报告"fs 视角同名"的名字；
+   - 工具 `scripts/_name_collision_check.py`：扫描目录，报告"fs 视角同名"的名字；
      `--explain 中文.txt` 可看某个字的全部同值字符。
    - 命名规则：同一目录内避免出现"逐字符比较值相同"的两个名字；最简单是加 ASCII 后缀
      （如 `报告1.docx` / `报告2.docx`），或换用不同码位块的字。
@@ -357,7 +357,7 @@ python _m6_oracle.py            # M6 unicorn 抽样差分：3 形状 × 3000 = 9
                                 # M8 同口径：见 _m8_diff*.log（5 形状 × 2000 = 10000/10000）
 python _m6_harvest_check.py     # M6 定位 + ctx/callee 收割 + 地址重编码往返：26/26 通过
 
-# 3b) 固件适配审计（fs_encode_fix/fs_fw_audit.py；表解析口径 = C++ str2hex 的逐字符）
+# 3b) 固件适配审计（scripts/fs_fw_audit.py；表解析口径 = C++ str2hex 的逐字符）
 python fs_fw_audit.py check --fs <FS_unc.kip1>    # 逐点：同址 / 漂移 / cmp 指纹
 python fs_fw_audit.py holes --fs <FS_unc.kip1>    # 七个替换点的洞与余量
 #   19.0.1 复验：exfat(081b) 14/14 同址、cmp 14/14；fat32(0819) 14/14 块漂移、cmp 14/14
@@ -388,6 +388,7 @@ python fs_fw_audit.py holes --fs <FS_unc.kip1>    # 七个替换点的洞与余�
 | M8 定位模板 | `fs_cp_fat_getnextchar_16.1.0+` / `_14.1.2-15.0.1`（22 / 4 份），入口 = 实测 `0xF44E0` |
 
 ### 相关文档
-- 事故复盘：`re_boot_hang_2026-09-15.md`（卡 logo：机器码错误 / 绝对地址 / 日志死锁）
-- 打不开复盘：`re_path_not_found_2026-09-15.md`（idx 语义 + 步进少 1）
-- 结构体权威：`fs_structs.h`；分析结论：`re_analysis.md`；改进计划：`re_improve_plan.md`
+- 结构体权威：`doc/fs_structs.h`；分析结论：`doc/fs-object-model.md`；测试计划：`doc/test-plan.md`
+- 设计现状与决策台账：`doc/design-decisions.md`
+- （2026-09-29 整理已删除事故复盘等过程文档；其结论并入本节「排障」与 `AGENTS.md` 硬不变量：
+  卡 logo = 机器码错误 / 绝对地址 / 日志死锁；能枚举却打不开 = `isOEMMBchar` 的 `byte_idx` 语义 + 步进少 1）

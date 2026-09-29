@@ -4,17 +4,14 @@
 >
 > | 想了解 | 去读 |
 > |---|---|
-> | 补丁**怎么实现**（逐函数、逐条目、守卫、排障） | **`fs_encode_fix/re_utf8_patch_final.md`** ← 权威 |
-> | 七个整函数替换的**功能合理性**（Ghidra 复核） | `fs_encode_fix/re_整函数替换功能评估.md` |
-> | **为什么**这么决策（2026-09-18~20 的时间线论证与实施记录） | `fs_encode_fix/补丁点合并优化分析·演进史.md` |
-> | 全部文档的层级与定位 | `fs_encode_fix/README.md` |
+> | 补丁**怎么实现**（逐函数、逐条目、守卫、排障） | **`doc/patch-design.md`** ← 权威 |
+> | 七个整函数替换的**功能合理性**（Ghidra 复核） | `doc/replace-fn-eval.md` |
+> | 版本兼容**选型**（指令级 vs 整函数替换） | `doc/fw-compat.md` |
+> | 全部文档的层级与定位 | `doc/README.md` |
 >
-> **编号约定**：本文**不给章节编号**。全项目里裸写的 `§13`/`§19` 之类**一律指演进史**——
-> 它保留了 2026-09-18~19 原始节号（外部文档按 § 引用它），而本文是后来收敛出来的摘要。
->
-> 本文曾是一份按时间追加的研究日志（原 §0–§19）。**它的结论会被后文推翻**（原 §9 说 M6 不做 /
-> 原 §13 说做了；原 §17 说不做 B / 原 §18 说做了），必须通读全篇才知道现状——因此拆成：
-> 本文只留**收敛后的现状与台账**，原始论证全部搬进**演进史**。
+> **本文不给章节编号**：本文档历史上是按时间追加的研究日志（结论会被后文推翻）。
+> 2026-09-29 整理时那篇「过程论证」已整篇删除，本文只留**收敛后的现状与决策台账**；
+> 现在文档里出现的 `§N` 一律指**该文档自身的章节**。
 
 ---
 
@@ -77,7 +74,7 @@
 
 条目**按函数分组、同函数相邻**（`FUNC_ORDER`）。原因是像 `WideChar_Compare` 这种函数曾承载 15 个
 互相依赖的补丁点——按站点扁平排列时，看表的人无法看出「它们其实是一件事」。M6 之后它塌缩为 **1 条 blob**。
-详：演进史 §2（三个根因 R1/R2/R3）、§8.1（M1 落地）。
+（三个根因 R1/R2/R3 与 M1 落地的过程论证已随过程文档删除，结论见上。）
 
 ### 门控：无条目级开关，只有「整份生效 / 整份跳过」
 
@@ -99,13 +96,13 @@
 | **S3** | **blob 车道快筛**：模板偏移 0 或 4 的确定字节作筛子，一位 2 取字节 + 2 查表 + 1 与 | blob 候选 1.607 亿 → **379 万**（−97.6%） |
 
 合计估算扫描指令量 **3.61×** 下降。等价性凭据：`_audit/_opt_equiv.py` 26/26（命中集合 / 站点 / 写入次数三方一致）。
-详：演进史 §19；活条目判据 `fs_pat_live()` / `fs_blob_live()` 在 `fs_codepage.cpp`。
+活条目判据 `fs_pat_live()` / `fs_blob_live()` 在 `fs_codepage.cpp`。
 
 ### 构建期守卫（`sysmod/tools/check_patch_sizes.py`，`make` 自动跑）
 
 尺寸从 `_end` 汇编标签自动取得（sysmod 需 `-fno-toplevel-reorder`），守卫**从源码文本解析**补丁表
 （`--main src/fs_codepage.cpp`）——表条目必须保持 `PAT_RE`/`BLOB_RE`/`GROUP_RE`/`PRED_LIST_RE` 可解析，
-**解析不了 = 静默不校验**。完整检查项清单见 `re_utf8_patch_final.md` §4。
+**解析不了 = 静默不校验**。完整检查项清单见 `patch-design.md` §4。
 
 尺寸恰好等于洞时报 **`⚠ ZERO SLACK` 告警**（能过，但下次代码生成波动就 `HOLE OVERFLOW`）。
 
@@ -131,15 +128,15 @@
 
 ### 表架构
 
-| 编号 | 方案 | 最终结论 | 依据 | 详文 |
-|---|---|---|---|---|
-| **M1** | 表结构两级化（函数 → 站点） | ✅ **已做**（`fs_fn_groups[12]`） | 结构改动，语义不变 | 演进史 §8.1 |
-| **M3** | 谓词位图替代逐条全段扫描 | ✅ **已做**（`fs_pred_plane[5]`） | 谓词命中 ⇒ 模板只可能在该字上匹配（`applied()` 回调证明不可达，已删） | 演进史 §8.2 |
-| **M6** | `WideChar_Compare` 整函数替换 | ✅ **已做**（p18–p26 折叠） | 可执行差分 9000/9000（`_m6_oracle.py`） | `re_utf8_patch_final.md` §3.5、演进史 §11–§13 |
-| **M7** | p11–p16 也并入 M6 | ✅ **已做**（该函数只剩 blob 一条路径） | 定位模板 22/22 命中，无固件失去补丁 | 演进史 §16 |
-| **M8** | `FAT_GetNextChar` 整函数替换 | ✅ **已做**（p05+p17 折叠） | 差分 6 形状 × 2000 例 = 12000/12000 | `re_utf8_patch_final.md` §3.6、演进史 §18 |
-| **M2** | 「规则 + 序号」替代字节模板（P2b） | ⛔ **未做**（暂缓，见 O6） | E3 已证可行，但工程量大、与 M6/M8 收益重叠 | 演进史 §3.E3、§4.M2 |
-| **M4 / M5** | 扫描窗口收缩 / 写入合并 | ⛔ **不做** | M4 要与函数边界=写死偏移冲突；M5 站点物理上无法合并 | 演进史 §14.4 |
+| 编号 | 方案 | 最终结论 | 依据 |
+|---|---|---|---|
+| **M1** | 表结构两级化（函数 → 站点） | ✅ **已做**（`fs_fn_groups[12]`） | 结构改动，语义不变 |
+| **M3** | 谓词位图替代逐条全段扫描 | ✅ **已做**（`fs_pred_plane[5]`） | 谓词命中 ⇒ 模板只可能在该字上匹配（`applied()` 回调证明不可达，已删） |
+| **M6** | `WideChar_Compare` 整函数替换 | ✅ **已做**（p18–p26 折叠） | 可执行差分 9000/9000（`_m6_oracle.py`）；实现见 `patch-design.md` §3.5 |
+| **M7** | p11–p16 也并入 M6 | ✅ **已做**（该函数只剩 blob 一条路径） | 定位模板 22/22 命中，无固件失去补丁 |
+| **M8** | `FAT_GetNextChar` 整函数替换 | ✅ **已做**（p05+p17 折叠） | 差分 6 形状 × 2000 例 = 12000/12000；实现见 `patch-design.md` §3.6 |
+| **M2** | 「规则 + 序号」替代字节模板（P2b） | ⛔ **未做**（暂缓，见 O6） | E3 已证可行，但工程量大、与 M6/M8 收益重叠 |
+| **M4 / M5** | 扫描窗口收缩 / 写入合并 | ⛔ **不做** | M4 要与函数边界=写死偏移冲突；M5 站点物理上无法合并 |
 
 ### 剩余优化项（2026-09-19 盘点）
 
@@ -167,15 +164,15 @@
 | **转换器差分** | `patch_utf16_to_utf8` 1 字节分支的 NUL 落点按原版写回 `[1]`（原版是 `strb wzr,[x1,#1]`，此前写 `[2]` 会让 `[1]` 留旧字节）。0x7C → 0x8C |
 | **O4 零余量** | 见上表 |
 | **日志精简** | 删 `[debug] tmp_buffer`/`tmp_addr`/`tmp_size`；`[fs_codepage]` 只列**已定位**条目，未命中数进 `[debug] fs_codepage_unmatched` |
-| **连带同步** | 守卫正则、`fs_encode_fix/fs_fw_audit.py` 的表解析正则、`AGENTS.md` / `README.md` / `re_utf8_patch_final.md` 文档；改名后另用 `D:/Game/NS/firmware/_audit/_map_variants.py`（生成覆盖）/`_check_name_ranges.py`（核对名字 vs 语料） |
+| **连带同步** | 守卫正则、`scripts/fs_fw_audit.py` 的表解析正则、`AGENTS.md` / `README.md` / `patch-design.md` 文档；改名后另用 `D:/Game/NS/firmware/_audit/_map_variants.py`（生成覆盖）/`_check_name_ranges.py`（核对名字 vs 语料） |
 
-详：`fs_encode_fix/re_整函数替换功能评估.md` §7（含仍未做项）。
+详：`doc/replace-fn-eval.md` §7（含仍未做项）。
 
 ---
 
 ## 不变量与铁律
 
-> 完整版（含为什么）在 `AGENTS.md`「FS codepage patch」一节与 `re_utf8_patch_final.md` §3.1；这里只列**不能碰**的。
+> 完整版（含为什么）在 `AGENTS.md`「FS codepage patch」一节与 `patch-design.md` §3.1；这里只列**不能碰**的。
 
 | 约束 | 违反后果 |
 |---|---|
@@ -186,7 +183,7 @@
 | **绝不手抄字节改机器码** | 只做语义等价改写（`rules_*`），差分目标是**与原版逐位一致** |
 | **短分支的 NUL 落点也算差分** | 原版 1 字节路径 NUL 在 `[1]`，只写 `[2]` 会留旧字节 |
 | **补丁是「整份生效 / 整份跳过」** | 无 per-entry 开关；`[options] fs_codepage=0` 跳过整份 |
-| **改表的连带清单** | `check_patch_sizes.py` + `fs_encode_fix/fs_fw_audit.py`（`FS_PAT_RE`/`FS_BLOB_RE`）漏一个就**静默失效** |
+| **改表的连带清单** | `check_patch_sizes.py` + `scripts/fs_fw_audit.py`（`FS_PAT_RE`/`FS_BLOB_RE`）漏一个就**静默失效** |
 | **条目名格式 `fs_cp_<功能名>_<版本范围>`** | 族号 = 版本范围之前的功能前缀（不是 `pNN`）。名字里的版本号是**语料实测覆盖**，改动后须用 `D:/Game/NS/firmware/_audit/_check_name_ranges.py` 复核（31 条 / 14 族 / 0 重叠），否则守卫 `NAME_RE` 解析不到、族内互斥退役失灵 |
 
 ---
@@ -205,30 +202,24 @@
 
 ## 文档地图
 
-完整层级与每篇定位见 **`fs_encode_fix/README.md`**。速查：
+完整层级与每篇定位见 **`doc/README.md`**。速查：
 
 ```
-README.md                                 用户向：功能、配置、构建
-AGENTS.md                                 智能体入口：构建、布局、硬不变量、文档地图
-补丁点合并优化分析.md  ← 本文            设计现状 + 决策台账（无编号）
-fs_encode_fix/
-    README.md                             文档层级索引（读这一篇定方向）
-    re_utf8_patch_final.md                ★ 权威：方案 + 实现 + 守卫 + 排障
-    re_整函数替换功能评估.md                七个 blob 的功能合理性（Ghidra）
-    补丁点合并优化分析·演进史.md            原 §1–§20 时间线论证（节号稳定，裸 §N 指它）
-    re_analysis.md                        FS 对象模型逆向（19.exfat）
-    callback_tables.md                    回调/vtable 表清单（参考数据）
-    re_fw_compat_design.md                版本兼容选型；fs_fw_audit.py 用法
-    re_fw_audit_19.0.1.md                 固件审计工具的 19.0.1 结论
-    cp936_vs_utf8.md                      GBK vs UTF-8 方案选型（结论：UTF-8）
-    re_ghidra_round19.md                  第十九轮 Ghidra 笔记
-    re_boot_hang_2026-09-15.md            事故：开机卡 logo
-    re_path_not_found_2026-09-15.md       事故：能枚举打不开
-    re_homebrew_crash_2026-09-16.md       事故：模拟器闪退（与本补丁无关）
-    re_bigdir_dir_as_file.md              事故：大目录被当文件
-    re_improve_plan.md                    改进清单（已实施，历史）
-    fs_encode_fix_test_plan.md            上机测试计划
-    plan.md                               早期 CP932→UTF-8 接口对照
-    _archive/README.md                    已退役脚本（只进不出，勿引用）
-M6_Ghidra反编译报告.md                      M6 三个形状的反编译全文（演进史 §10 依据）
+README.md                 用户向：功能、配置、构建
+AGENTS.md                 智能体入口：构建、布局、硬不变量、文档地图
+doc/README.md             文档层级索引（读这一篇定方向）
+doc/patch-design.md       ★ 权威：方案 + 实现 + 守卫 + 排障
+doc/design-decisions.md   ← 本文：设计现状 + 决策台账（无编号）
+doc/replace-fn-eval.md    七个替换体的功能合理性（Ghidra 复核）
+doc/fw-compat.md          版本兼容选型；scripts/fs_fw_audit.py 用法
+doc/fs-object-model.md    FS 对象模型逆向（19.exfat）
+doc/callback-tables.md    回调/vtable 表清单（参考数据）
+doc/encoding-choice.md    GBK vs UTF-8 方案选型（结论：UTF-8）
+doc/interface-map.md      CP932 → UTF-8 接口级对照
+doc/test-plan.md          上机测试计划
+scripts/                  离线工具（fs_fw_audit.py / _fs_dis.py / _dump_blobs.py / _name_collision_check.py）
 ```
+
+2026-09-29 整理时**已删除**：过程性论证（演进史全文）、逐轮 Ghidra 笔记、已实施的改进清单、
+事故 post-mortem、退役脚本归档 `_archive/`。这些结论已并入本文与 `patch-design.md`；
+原始过程仍可在 git 历史（`eff8a96`）或 `D:/Design/NS/sys-patch` 的 `dev/fs-codepage` 分支查到。

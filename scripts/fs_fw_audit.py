@@ -1588,7 +1588,7 @@ def cmd_holes(args):
     洞表来自 Ghidra 的函数边界，换固件必须重推，否则构建守卫
     (sysmod/tools/check_patch_sizes.py) 的 FUNCTIONS 表就是错的。
     做法：先用锚点在新镜像里定位洞的**边界地址**（相邻函数入口），
-    新洞 = 新边界 − 新补丁点；再读 sys-patch.elf 的符号尺寸算余量。
+    新洞 = 新边界 − 新补丁点；再读 fs-codepage.elf 的符号尺寸算余量。
     """
     main_cpp = os.path.abspath(args.main)
     if not os.path.exists(main_cpp):
@@ -1874,7 +1874,7 @@ def main():
                         help="比对基线 fs（默认 19.exfat.FS.kip1）")
     common.add_argument("--main", default=MAIN_CPP, help="fs 补丁表源码路径（默认 sysmod/src/fs_codepage.cpp）")
     common.add_argument("--elf", default=ELF_PATH,
-                        help="sys-patch.elf（holes 用，读替换函数尺寸）")
+                        help="fs-codepage.elf（holes 用，读替换函数尺寸）")
     common.add_argument("--hactool", default=HACTOOL)
     common.add_argument("--nstool", default=NSTOOL)
     common.add_argument("--keys", default=KEYS)
