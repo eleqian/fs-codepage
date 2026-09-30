@@ -417,8 +417,8 @@ PROGRESS_RE = re.compile(r'fs_(?:stage|progress)\(\s*"([^"]+)"\s*\)')
 # --- pattern 驱动的两级表：fs_fn_groups[] / fs_inst_patches[] / fs_blob_patches[]
 # 与 sysmod/tools/check_patch_sizes.py 的解析保持一致；`.` 是通配（REGEX_SKIP）。
 # ⚠️ 表在 **fs_codepage.cpp**（2026-09-19 从 main.cpp 拆出），改表格式时本文件要同步。
-# 条目名 = `<功能名>_<版本范围>`（如 fs_cp_makeshortname_15.0.1-20.5.0；
-#           范围沿用原 sys-patch：`a.b.c-d.e.f` / `a.b.c+`，非连续覆盖用 `,` 分段）。
+# 条目名 = `<功能名>_<版本范围>`（如 fs_cp_makeshortname_15-20；
+#           2026-09-30 起范围按**大版本**写：`12` / `12-15` / `16+`，`,` 分段多段）。
 #           故名字允许 `. + - ,`——正则字符集必须包含，否则整条静默丢掉。
 # FsInstPatch = { name, pattern, inst_offset, cond, patch }
 #            （P1 的 `rules_applied<X>` 列、2026-09-20 的 stage_idx 与 needs_wide_cmp
@@ -436,36 +436,33 @@ FS_STAGE_RE = re.compile(
 
 
 def parse_fs_pattern(s):
-    """'0xAB.CD' -> [0xAB, None, 0xCD]（None = 通配）；非法返回 None。
+    """'0xAB..CD' -> [0xAB, None, 0xCD]（None = 通配）；非法返回 None。
 
-    ⚠️ 口径与 C++ 的 `str2hex` 一致：**一个 `.` = 一个通配字节**（逐字符解析）。
-    不要写成"`..` = 一个通配字节"——那是历史 PATTERNS.json 的写法，两者混用会让
-    槽数翻倍（轻则不命中、重则整表 0 命中）。构建期守卫用的是同一口径。
+    ⚠️ 必须与 `patch_types.h` 的 `str2hex` 同构：**一个 `..` = 一个通配字节**
+    （它在看到 '.' 时 `s += 2` 吃掉两个点），单个 '.' 非法 —— 与系统标题补丁表、
+    构建期守卫 `check_patch_sizes.py::parse_pattern` 三者一致。
+
+    历史坑：这里曾经按"一个 `.` 一槽"解析，与 str2hex 差一倍槽数 —— 表现是
+    **凡是通配符不在模板末尾的条目一律 0 命中**（2026-09-30 审计 10.x~13.x 老固件时
+    才发现：31 条里 24 条被误报"这份固件上 0 命中"，连 14.1.2 自己都只命中 4 条）。
+    改本函数时同步看 check_patch_sizes.py。
     """
     body = s[2:]
     out = []
-    for ch in body:
-        if ch == ".":
-            out.append(None)
-        elif ch in "0123456789abcdefABCDEF":
-            out.append(ch)
-        else:
-            return None
-    # 半字节（奇数个十六进制字符）非法：两两合并成字节
-    if len([c for c in out if c is not None]) % 2:
-        return None
-    res, hi = [], None
-    for ch in out:
-        if ch is None:
-            if hi is not None:
+    i = 0
+    while i < len(body):
+        if body[i] == ".":
+            if body[i + 1:i + 2] != ".":
                 return None
-            res.append(None)
-        elif hi is None:
-            hi = ch
+            out.append(None)
+            i += 2
         else:
-            res.append(int(hi + ch, 16))
-            hi = None
-    return res
+            pair = body[i:i + 2]
+            if not re.fullmatch(r"[0-9A-Fa-f]{2}", pair):
+                return None
+            out.append(int(pair, 16))
+            i += 2
+    return out
 
 
 def find_pattern(hay, pat, limit=64):
@@ -1439,7 +1436,9 @@ def audit_at(args, fs_path, work, write=True, report_name="report.md",
              quiet=False, label=""):
     """对一个 fs 二进制做逐点比对 + 重定位。返回 (results, counts)。"""
     main_cpp = os.path.abspath(args.main)
-    sites = parse_sites(main_cpp)
+    # pattern 驱动表的 site/cmp 由**基线**反推，所以必须把 --base-fs 传进去：
+    # 否则换基线只影响重定位、不影响取点，扫老固件时永远只有 19.0.1 命中的那一族。
+    sites = parse_sites(main_cpp, args.base_fs)
     if not os.path.exists(fs_path):
         sys.exit("error: 找不到 fs 二进制 %s" % fs_path)
 

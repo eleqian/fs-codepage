@@ -7,6 +7,12 @@
 本工程把它拆成单独的补丁插件，作为**备选方案**——可与**原版（upstream）sys-patch
 并存安装**，sys-patch 项目本体不做任何改动。
 
+**支持范围：Horizon OS 10.0.0 及以上（实测覆盖 10.x–22.x，共 40 条变体 / 14 个补丁族）。**
+条目的版本范围按**逐小版本实测端点**命名（`10.0.0-14.1.2` / `16.0.0+` /
+`10.0.0-14.1.2,21.0.0+` 等；fs 驱动在大版本内也会换，major 粒度命名会失真）。
+低于 10.0.0 的 fs 属于更早的代码生成，**不在支持范围**——运行期有版本门控
+（`< 10.0.0` 整份跳过，结果记 `unsupported_fw_version`；取不到版本时放行）。
+
 ## 与 sys-patch 的共存（兼容性）
 
 | 组合 | 行为 |
@@ -74,7 +80,7 @@ sysmod/
   fs-codepage.json       NPDM（name/title_id 与 sys-patch 不同）
   toolbox.json           Toolbox 列表项
   src/main.cpp           模块骨架：配置、调度（重试）、日志
-  src/fs_codepage.cpp    补丁本体（自 sys-patch fork 原样复制，未改）
+  src/fs_codepage.cpp    补丁本体（表 + 7 个替换体；自 sys-patch fork 复制后独立演进）
   src/fs_codepage.h      API
   src/patch_types.h      pattern/patch 基元（自 sys-patch fork 原样复制）
   tools/check_patch_sizes.py  构建期守卫（原样复制）
@@ -82,8 +88,9 @@ doc/                     设计文档与逆向结论（不参与构建），索�
 scripts/                 离线工具：固件审计等（不参与构建，需时手动跑）
 ```
 
-`fs_codepage.*` / `patch_types.h` / `check_patch_sizes.py` 与 sys-patch fork
-保持逐字节同步；若 fork 侧表有更新，直接重新复制这四个文件即可。
+`fs_codepage.*` / `patch_types.h` / `check_patch_sizes.py` 拆分时自 sys-patch fork 逐字节复制；
+**2026-09-30 起本工程是权威侧**（改名 + 12/13 覆盖已改动 `fs_codepage.cpp` 与
+`check_patch_sizes.py`），fork 侧停在旧版。四文件若需同步，方向改为本工程 → fork。
 
 ## 文档与历史（2026-09-29 从 sys-patch 迁来，本工程单独维护）
 
@@ -100,7 +107,8 @@ doc/design-decisions.md  设计现状 + 决策台账
 doc/fw-compat.md       版本兼容选型 + 固件审计工具用法
 doc/{fs-object-model,interface-map,encoding-choice,replace-fn-eval,test-plan}.md
 doc/{callback-tables.md,fs_structs.h}   参考数据
-scripts/               离线工具（fs_fw_audit.py / _fs_dis.py / _dump_blobs.py / _name_collision_check.py）
+scripts/                 离线工具（fs_fw_audit.py / fs_pat_hits.py / fs_version_matrix.py /
+                         _fs_dis.py / _dump_blobs.py / _name_collision_check.py）
 .workbuddy/memory/     逐日工作日志（13~29 日）+ MEMORY.md 长期备忘
 ```
 

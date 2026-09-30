@@ -149,6 +149,13 @@ int main(int argc, char* argv[]) {
 
     if (enable_patching) {
         if (fs_codepage_enabled) {
+            // 版本下限门控：补丁表按实测只覆盖 ≥ 10.0.0；更老的 fs 是更早的代码生成，
+            // 会出现「部分条目命中、部分不命中」的半成品（FAT_MakeShortName 宽度钳制与
+            // 转换器不成对 ⇒ 建 CJK 名时死循环）。FW_VERSION 取不到时为 0 —— 必须放行
+            // （setsys 失败不应让补丁静默失效），命中判定交给 pattern 扫描兜底。
+            if (FW_VERSION != 0 && FW_VERSION < MAKEHOSVERSION(10, 0, 0)) {
+                fs_codepage_patch_result = "unsupported_fw_version";
+            } else {
             // 附加调试进程后 fs 会被挂起，此后不能再写日志，所以先落一条标记
             if (enable_logging) {
                 ini_puts("debug", "fs_codepage", "start", log_path);
@@ -162,6 +169,7 @@ int main(int argc, char* argv[]) {
                     break;
                 }
                 svcSleepThread(ATTACH_RETRY_MS * 1000000ULL);
+            }
             }
         } else {
             fs_codepage_patch_result = "disabled_by_config";

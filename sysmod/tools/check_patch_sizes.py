@@ -67,9 +67,10 @@ FUNCTIONS = [
          hole_src="original extent 0xfee40..0xfee8c + the udf padding word at 0xfee8c; "
                   "0xfee90 (mov w0,#2; ret) is a callback-table stub and must be preserved"),
     dict(symbol="patch_str_unicode2oem", end_symbol="patch_str_unicode2oem_end",
-         site=0xF5840, hole=0x120,
+         site=0xF5840, hole=0x110,
          site_name="PFCODE_Str_Unicode2OEM",
-         hole_src="next function 0x71000f5960 (Str_OEM2Unicode)"),
+         hole_src="next function 0x71000f5960 (Str_OEM2Unicode)；"
+                  "10.0.0/11.0.1 实测最小洞 0x110（仍 > 替换体 0xEC），取全局最小 0x110"),
     dict(symbol="patch_stringdesc_toupper", end_symbol="patch_stringdesc_toupper_end",
          site=0xF7C10, hole=0xB0,
          site_name="StringDesc_ToUpper",
@@ -465,16 +466,21 @@ def kip1_text(data):
     return data[0x100 + off:0x100 + off + size]
 
 
-# 条目名规则：`<功能名>_<版本范围>`（范围沿用原 sys-patch 约定：`a.b.c-d.e.f` 闭区间 /
-# `a.b.c+` 开区间；非连续覆盖用 `,` 分段）。功能前缀 = 族（补丁点）标识，
+# 条目名规则：`<功能名>_<版本范围>`。功能前缀 = 族（补丁点）标识，
 # 与 fs_codepage.cpp 的 fs_family_of() 同口径。
-_VER_ITEM = r"\d+\.\d+\.\d+(?:-\d+\.\d+\.\d+)?\+?"
+#
+# 版本范围按**实测精确 x.y.z 粒度**写（2026-09-30 定稿）：
+#   `12.0.0` 单点 / `12.0.0-15.0.1` 闭区间 / `16.0.0+` 开区间 / `12.0.0-14.1.2,21.0.0+` 多段。
+# 依据：fs 驱动在大版本内也会换（12.0.x→12.1.0 等六例实证），major 粒度命名会失真。
+# 兼容旧写法 `a.b.c` / major 单段（`12` / `12-15` / `16+`），但不再使用。
+_VER_MAJOR = r"\d+(?:\.\d+\.\d+)?"
+_VER_ITEM = _VER_MAJOR + r"(?:-" + _VER_MAJOR + r")?\+?"
 NAME_RE = re.compile(r"^(?P<point>fs_cp_[a-z0-9_]+?)_(?P<ver>" + _VER_ITEM +
                      r"(?:," + _VER_ITEM + r")*)$")
 
 
 def point_of(name):
-    """'fs_cp_makeshortname_14.1.2,21.0.0+' -> 'fs_cp_makeshortname'；不合规返回 None。
+    """'fs_cp_makeshortname_12-14,21+' -> 'fs_cp_makeshortname'；不合规返回 None。
 
     族 = 名字里版本范围之前的功能前缀（与 fs_family_of 同口径）。名字不合规会让该条目
     退化成「不参与兄弟退役」（只是变慢，仍正确），所以要报错而不是静默。"""

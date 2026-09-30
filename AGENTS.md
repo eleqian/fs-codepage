@@ -39,14 +39,26 @@ UTF-8 <-> UTF-16，让 FAT/exFAT 卷支持中文等 3 字节 UTF-8 文件名。C
 - **Never hardcode an fs offset or global.** 一切靠字节模式定位；随版本变化的值（代码页 ctx 槽、
   一个外部 callee）由哨兵 `0xDEAD0001/2`、`0xDEAD0003/4` 在打补丁时从原函数体收割，
   **收割失败该点整组放弃**（不写任何字节）。
-- **Pattern notation.** 表与 `patch_types.h` 用 `.` = 一个通配字节；离线脚本/JSON 用 `..` = 一个通配字节。
-  两种写法**不要混**，混了会整表 0 命中。
+- **Pattern notation.** 只有一种写法：**`..` = 一个通配字节**（单个 `.` 非法），
+  依据是 `patch_types.h::str2hex`（看到 `.` 就 `s += 2`）。**表 / C++ / 离线脚本 / JSON
+  同一口径**，不要按「一个 `.` 一槽」写——那样槽数翻倍，通配符不在末尾的条目会全部 0 命中。
+- **Entry naming.** `fs_cp_<功能名>_<版本范围>`，版本范围 = **逐小版本实测端点**（x.y.z）：
+  `10.0.0-14.1.2` / `16.0.0+` / `10.0.0-14.1.2,21.0.0+`。支持下限 **10.0.0**（main.cpp 有
+  `MAKEHOSVERSION(10,0,0)` 门控；取不到版本则放行）、上限 = 语料最新 **22.5.0**。
+  ⚠️ **「同一大版本内 fs 不变」是错的**（12.0.x→12.1.0、16.0.2→16.0.3、
+  22.1.0→22.5.0 等都换驱动，补丁点恰在不变区）—— 不要再按 major 写范围。
+  族号 = 版本范围之前的功能前缀。**改名后必跑 `scripts/fs_version_matrix.py`**（范围 == 实测
+  命中 + 族内不相交 + 每份固件 14/14）。23.0.0 待新 master key。
 - **No per-entry gating.** 整份生效或整份跳过（`[options] fs_codepage=0`），没有中间态 ——
   半成品的 fs 会挂（换了转换器却没打配对的宽度钳制 ⇒ `FAT_MakeShortName` 死循环）。
 - **Never hand-edit machine code** in the replacement bodies —— 只做语义等价改写，
   并复验 7 个替换体尺寸逐位不变。
-- **四文件与 sys-patch fork 逐字节同步**（`fs_codepage.cpp/.h`、`patch_types.h`、`check_patch_sizes.py`）：
-  fork 侧表有更新就重新复制；复制后本工程的 `main.cpp` 不动。
+- **四文件源自 sys-patch fork**（`fs_codepage.cpp/.h`、`patch_types.h`、`check_patch_sizes.py`），
+  拆分时逐字节复制。**2026-09-30 起本工程是权威侧**：改名（大版本范围）+ 12/13 覆盖
+  已改动 `fs_codepage.cpp` 与 `check_patch_sizes.py`，fork 侧停在旧版（其 `fs_codepage`
+  默认关闭，无影响）。需要时回拷（方向改为本工程 → fork）：
+  `cp sysmod/src/fs_codepage.cpp sysmod/tools/check_patch_sizes.py D:/Design/NS/sys-patch/sysmod/{src,tools}/`
+  fork 若有表更新仍需反向复制过来并跑守卫。
 
 ## Docs
 

@@ -850,8 +850,8 @@ constexpr PatchData rules_movz_2e_to_movz2(u32 inst)
 // ⚠️ 行内格式由构建期守卫按正则从**源码文本**解析，改格式必须同步
 //    tools/check_patch_sizes.py（以及 dev/fs-codepage 分支上的 fs_fw_audit.py）：
 //   patch_name    log.ini 键名；格式 `<功能名>_<版本范围>`，族号 = 版本范围之前的
-//                 功能前缀（fs_family_of）。范围沿用原 sys-patch：`a.b.c-d.e.f` 闭区间 /
-//                 `a.b.c+` 开区间；非连续覆盖用 `,` 分段。
+//                 功能前缀（fs_family_of）。范围 = 语料实测覆盖，精确到 x.y.z：
+//                 `12.0.0-15.0.1` / `16.0.0+`；非连续覆盖用 `,` 分段。
 //   byte_pattern  定位模板；"0x" 之后一个 ".." = 一个通配字节
 //   inst_offset   落点指令 = 命中处 + inst_offset（字长的倍数）
 //   cond / patch  指令改写：cond(inst) 判定，patch(inst) 现场算等价新指令
@@ -963,85 +963,108 @@ struct FsInstPatch {
 // 下标区间（左闭右开）。注释里的地址 = 参考二进制 19.0.1/exfat 的实测函数入口，
 // 由构建期守卫核对；进度日志打的也是 label。
 constinit FsFnGroup fs_fn_groups[] = {
-    { "IDirectory_Read          ",  0,  2,  0,  0 }, // 0xD4AF4   2 指令
-    { "FAT_GetNextChar          ",  2,  2,  0,  2 }, // 0xF44E0   2 替换
-    { "WideChar_Compare         ",  2,  2,  2,  6 }, // 0xF4770   4 替换
-    { "FAT_GetNextPathComponent ",  2,  4,  6,  6 }, // 0xF4BBC   2 指令
-    { "FAT_MakeShortName        ",  4,  6,  6,  6 }, // 0xF5AC0   2 指令
-    { "StringDesc_AddLeft       ",  6,  8,  6,  6 }, // 0xF7788   2 指令
-    { "StringDesc_GetCharCount  ",  8, 10,  6,  6 }, // 0xF7924   2 指令
-    { "StringDesc_CompareUnicode", 10, 12,  6,  6 }, // 0xF79F4   2 指令
-    { "StringDesc_CompareOem    ", 12, 15,  6,  6 }, // 0xF7B14   3 指令
-    { "PFCODE_Converters        ", 15, 15,  6, 11 }, // -         5 替换
-    { "PFCODE_Str_Unicode2OEM   ", 15, 15, 11, 14 }, // 0xF5840   3 替换
-    { "StringDesc_ToUpper       ", 15, 15, 14, 16 }, // 0xF7C10   2 替换
+    { "IDirectory_Read          ",  0,  3,  0,  0 }, // 0xD4AF4   3 指令
+    { "FAT_GetNextChar          ",  3,  3,  0,  3 }, // 0xF44E0   3 替换
+    { "WideChar_Compare         ",  3,  3,  3,  8 }, // 0xF4770   5 替换
+    { "FAT_GetNextPathComponent ",  3,  5,  8,  8 }, // 0xF4BBC   2 指令
+    { "FAT_MakeShortName        ",  5,  7,  8,  8 }, // 0xF5AC0   2 指令
+    { "StringDesc_AddLeft       ",  7,  9,  8,  8 }, // 0xF7788   2 指令
+    { "StringDesc_GetCharCount  ",  9, 11,  8,  8 }, // 0xF7924   2 指令
+    { "StringDesc_CompareUnicode", 11, 14,  8,  8 }, // 0xF79F4   3 指令
+    { "StringDesc_CompareOem    ", 14, 18,  8,  8 }, // 0xF7B14   4 指令
+    { "PFCODE_Converters        ", 18, 18,  8, 15 }, // -         7 替换
+    { "PFCODE_Str_Unicode2OEM   ", 18, 18, 15, 19 }, // 0xF5840   4 替换
+    { "StringDesc_ToUpper       ", 18, 18, 19, 22 }, // 0xF7C10   3 替换
 };
 
-// 15 条指令改写条目（顺序 = 上面各组的指令区间）。
-// 名字 = `<功能名>_<版本范围>`（范围写法沿用原 sys-patch 约定：`a.b.c-d.e.f` 闭区间 /
-// `a.b.c+` 开区间；非连续覆盖用 `,` 分段）。同一功能名的多条模板 = **跨版本互斥的
-// 变体族**（见「族」机制：族号就是从名字里剥掉版本范围后的功能前缀）。
+// 18 条指令改写条目（顺序 = 上面各组的指令区间）。
+// 名字 = `<功能名>_<版本范围>`。同一功能名的多条模板 = **跨版本互斥的变体族**
+// （见「族」机制：族号就是从名字里剥掉版本范围后的功能前缀）。
+//
+// ⚠️ 版本范围 = **语料实测**（`scripts/fs_version_matrix.py`，逐小版本 × 逐条目数命中），
+// 写成精确 x.y.z 粒度：`12.0.0-15.0.1` / `16.0.0+` / `12.0.0-14.1.2,21.0.0+`。
+// 依据（2026-09-30 全语料 45 版实测）：fs 驱动**在大版本内也会变**（12.0.x→12.1.0、
+// 13.0.0→13.1.0、16.0.2→16.0.3、18.0.x→18.1.0、21.1.0→21.2.0、22.1.0→22.5.0 各有
+// 新代），major 粒度命名是外推、会失真 ⇒ 必须按实测端点写；区间内未入库的小版本
+// 由「模式命中 + 谓词校验 + 收割失败整组放弃」兜底。改名后必跑 fs_version_matrix。
 constinit FsInstPatch fs_inst_patches[] = {
     // IDirectory_Read：名字字符校验分支 b.<cc> → nop（否则非英文名一律被拒）
-    { "fs_cp_idirectory_read_16.1.0+",          "0x..FD0151....0131......54", 8, rules_is_bcond, rules_nop },
-    { "fs_cp_idirectory_read_14.1.2-15.0.1",    "0x..FDFF54..890051........", 0, rules_is_bcond, rules_nop },
+    { "fs_cp_idirectory_read_16.0.0+",            "0x..FD0151....0131......54", 8, rules_is_bcond, rules_nop },
+    { "fs_cp_idirectory_read_12.0.0-15.0.1",          "0x..FDFF54..890051........", 0, rules_is_bcond, rules_nop },
+    { "fs_cp_idirectory_read_10.0.0-11.0.1",      "0x........2A8900515FE90071A8000054........6A21CA9A5F0116EA", 0, rules_is_bcond, rules_nop },
     // FAT_GetNextPathComponent：步进 add Rd,Rn,#1 → add Rd,Rn,w0（按 UTF-8 字符长前进）
-    { "fs_cp_fat_getnextpathcomp_step_15.0.1+", "0x..00805209050091690600F9", 4, rules_is_add_imm, rules_add_imm_to_add0 },
-    { "fs_cp_fat_getnextpathcomp_step_14.1.2",  "0x680640F909050091690600F9", 4, rules_is_add_imm, rules_add_imm_to_add0 },
+    //   12-14 那条尾部多带一拍 `ldr x9,[x28,#0x30]`（ctx+0x30 = isOEMMBchar）作锚：
+    //   12 字节的短模板会撞进一个同形的字符串追加函数。
+    { "fs_cp_fat_getnextpathcomp_step_15.0.0+",   "0x..00805209050091690600F9", 4, rules_is_add_imm, rules_add_imm_to_add0 },
+    { "fs_cp_fat_getnextpathcomp_step_10.0.0-14.1.2", "0x680640F909050091690600F9891B40F9", 4, rules_is_add_imm, rules_add_imm_to_add0 },
     // FAT_MakeShortName：宽度钳制 → movz wD,#2
     //   （原版按 OEMCharWidth 走 2 字节拷贝循环，UTF-8 的 3 字节字符会让 subs 永不归零）
-    //   同一功能的两种源指令形态：15.0.1–20.5.0 是 `mov wD,w0`；14.1.2 与 21.0.0+ 是
+    //   同一功能的两种源指令形态：15–20 是 `mov wD,w0`；10–14 与 21+ 是
     //   `movz wD,#0x2e`（故后者的版本范围分两段）。
-    { "fs_cp_makeshortname_15.0.1-20.5.0",      "0xE80740B9F703002A1F21..6B", 4, rules_is_mov_w0, rules_mov_reg_to_movz2 },
-    { "fs_cp_makeshortname_14.1.2,21.0.0+",     "0xF703002ACD0580521F21..6B", 4, rules_is_movz_2e, rules_movz_2e_to_movz2 },
+    { "fs_cp_makeshortname_15.0.0-20.5.0",            "0xE80740B9F703002A1F21..6B", 4, rules_is_mov_w0, rules_mov_reg_to_movz2 },
+    { "fs_cp_makeshortname_10.0.0-14.1.2,21.0.0+",        "0xF703002ACD0580521F21..6B", 4, rules_is_movz_2e, rules_movz_2e_to_movz2 },
     // StringDesc 消费点（AddLeft / GetCharCount / CompareUnicode / CompareOem）：
     //   csel/cinc（跳 1 或 2 字节）→ 无条件 add Rd,Rn,w0
-    { "fs_cp_str_addleft_15.0.1+",              "0x94060051C806961A9F3E0072", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_addleft_14.1.2",               "0xC806961A940600519F3E007216050011", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_getcharcount_16.1.0+",         "0x940600117306939A601E4038", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_getcharcount_14.1.2-15.0.1",   "0x..06..9A........60..40....FFFF35....................41..", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareunicode_16.1.0+",       "0xA11300D16802969A13050091", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareunicode_14.1.2-15.0.1", "0x....969A........A80E40F9..............................78............0034..01....", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareoem_16.1.0-18.1.0",     "0x1F000071........89....9A", 8, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareoem_19.0.1+",           "0x1F0000719402979A..264078", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareoem_14.1.2-15.0.1",     "0x..06..9A................................0001094B......A9........FD7B......03....", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_addleft_15.0.0+",                "0x94060051C806961A9F3E0072", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_addleft_10.0.0-14.1.2",              "0xC806961A940600519F3E007216050011", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_getcharcount_16.0.0+",           "0x940600117306939A601E4038", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_getcharcount_10.0.0-15.0.1",         "0x..06..9A........60..40....FFFF35..........................", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_compareunicode_16.0.0+",         "0xA11300D16802969A13050091", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_compareunicode_12.0.0-15.0.1",       "0x....969A........A80E40F9..............................78............0034..01....", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_compareunicode_10.0.0-11.0.1",   "0x6802969A13050091A80E40F9E1330091", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_compareoem_16.0.0-18.1.0",           "0x1F000071........89....9A", 8, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_compareoem_19.0.0+",             "0x1F0000719402979A..264078", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_compareoem_12.0.0-15.0.1",           "0x..06..9A................................0001094B......A9........FD7B......03....", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_str_compareoem_10.0.0-11.0.1",       "0x8906949AB50A009134050091A8FDFF35E9031F2A0001094BFD7B43A9", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
 };
 
-// 16 条整函数替换条目：pattern 只负责定位，写入的是自包含、位置无关的替换实现。
+// 22 条整函数替换条目：pattern 只负责定位，写入的是自包含、位置无关的替换实现。
 // 名字规则同 fs_inst_patches（功能名 + 版本范围）。
 constinit FsBlobPatch fs_blob_patches[] = {
     // FAT_GetNextChar → patch_fat_getnextchar（折叠该函数里全部 4 个指令点）
-    { "fs_cp_fat_getnextchar_16.1.0+",            "0xFF0301D1FD7B01A9F65702A9F44F03A9FD430091091040B9",          0, FsBlobImpl::FatGetNextChar },
-    { "fs_cp_fat_getnextchar_14.1.2-15.0.1",      "0xFF0301D1FD7B01A9FD430091F65702A9F44F03A9..1040B9F303012A",    0, FsBlobImpl::FatGetNextChar },
+    { "fs_cp_fat_getnextchar_16.0.0+",               "0xFF0301D1FD7B01A9F65702A9F44F03A9FD430091091040B9",          0, FsBlobImpl::FatGetNextChar },
+    { "fs_cp_fat_getnextchar_12.0.0-15.0.1",             "0xFF0301D1FD7B01A9FD430091F65702A9F44F03A9..1040B9F303012A",    0, FsBlobImpl::FatGetNextChar },
+    { "fs_cp_fat_getnextchar_10.0.0-11.0.1",         "0xFF0301D1F65701A9F44F02A9FD7B03A9FDC30091091040B9",          0, FsBlobImpl::FatGetNextChar },
     // WideChar_Compare → patch_widechar_compare（折叠该函数里全部 15 个指令点）
-    { "fs_cp_widechar_compare_17.0.0+",           "0xFF4302D1FD7B03A9FB2300F9FA6705A9F85F06A9F65707A9F44F08A9FDC30091........F30303AA", 0, FsBlobImpl::WideCharCompare },
-    { "fs_cp_widechar_compare_16.1.0",            "0xFF0302D1FD7B03A9FA6704A9F85F05A9F65706A9F44F07A9FDC30091........F30303AA",     0, FsBlobImpl::WideCharCompare },
-    { "fs_cp_widechar_compare_14.1.2",            "0xFF4302D1FD7B03A9FDC30091FB2300F9FA6705A9F85F06A9F65707A9F44F08A9..0C00D0",     0, FsBlobImpl::WideCharCompare },
-    { "fs_cp_widechar_compare_15.0.1",            "0xFF4302D1FD7B03A9FDC30091FB2300F9FA6705A9F85F06A9F65707A9F44F08A9....00..F30303AA", 0, FsBlobImpl::WideCharCompare },
+    //   12-14 那条把尾部 adrp 的 4 字节整拍放宽（老固件 ctx 槽地址不同）并补
+    //   `F30303AAF40301AA` 作锚 —— 只放宽不补锚会有 7~8 个命中点。
+    { "fs_cp_widechar_compare_17.0.0+",              "0xFF4302D1FD7B03A9FB2300F9FA6705A9F85F06A9F65707A9F44F08A9FDC30091........F30303AA", 0, FsBlobImpl::WideCharCompare },
+    { "fs_cp_widechar_compare_16.0.0-16.1.0",               "0xFF0302D1FD7B03A9FA6704A9F85F05A9F65706A9F44F07A9FDC30091........F30303AA",     0, FsBlobImpl::WideCharCompare },
+    { "fs_cp_widechar_compare_12.0.0-14.1.2",            "0xFF4302D1FD7B03A9FDC30091FB2300F9FA6705A9F85F06A9F65707A9F44F08A9................F30303AAF40301AA", 0, FsBlobImpl::WideCharCompare },
+    { "fs_cp_widechar_compare_15.0.0-15.0.1",               "0xFF4302D1FD7B03A9FDC30091FB2300F9FA6705A9F85F06A9F65707A9F44F08A9....00..F30303AA", 0, FsBlobImpl::WideCharCompare },
+    { "fs_cp_widechar_compare_10.0.0-11.0.1",        "0xFF4302D1FB1B00F9FA6704A9F85F05A9F65706A9F44F07A9FD7B08A9FD030291................F30303AAF40301AA", 0, FsBlobImpl::WideCharCompare },
     // PFCODE 三个编码原语（ctx 回调表指向的函数）→ UTF-8 实现
-    { "fs_cp_pfcode_unicode2oem_14.1.2+",         "0x00000000..004079..FD0171",                              4, FsBlobImpl::Utf16ToUtf8 },
-    { "fs_cp_pfcode_oem2unicode_16.1.0+",         "0x........0800C039..1D0012",                                 4, FsBlobImpl::Utf8ToUtf16 },
-    { "fs_cp_pfcode_is_oem_mb_char_16.1.0+",      "0x08..........................00....078052......7A",                      0, FsBlobImpl::IsOemMbChar },
-    { "fs_cp_pfcode_oem2unicode_14.1.2-15.0.1",   "0x0A00C039..1D0012..03..2A0A03F836..7D0111",                0, FsBlobImpl::Utf8ToUtf16 },
-    { "fs_cp_pfcode_is_oem_mb_char_14.1.2-15.0.1","0x0A000151....00....1C00......00......00..EA279F1A3F010071",      0, FsBlobImpl::IsOemMbChar },
+    //   OEM2Unicode 在 12.x 上是另一代代码生成（tbz 在下、无 strh/mov 三连），
+    //   而 16.x+ 那条松散模板会**意外**命中它（落点对但名字说谎）⇒ 单独开一条，
+    //   并把 16+ 那条补上 `mov w0,#1` 收紧。
+    { "fs_cp_pfcode_unicode2oem_10.0.0+",            "0x00000000..004079..FD0171",                              4, FsBlobImpl::Utf16ToUtf8 },
+    { "fs_cp_pfcode_oem2unicode_10.0.0-12.1.0",             "0x0800C0390A1D0012EB030A2A2803F836",                      0, FsBlobImpl::Utf8ToUtf16 },
+    { "fs_cp_pfcode_oem2unicode_13.0.0-15.0.1",          "0x0A00C039..1D0012..03..2A0A03F836..7D0111",                0, FsBlobImpl::Utf8ToUtf16 },
+    { "fs_cp_pfcode_oem2unicode_16.0.0+",            "0x........0800C039..1D0012........20008052",                4, FsBlobImpl::Utf8ToUtf16 },
+    { "fs_cp_pfcode_is_oem_mb_char_12.0.0-15.0.1",       "0x0A000151....00....1C00......00......00..EA279F1A3F010071",      0, FsBlobImpl::IsOemMbChar },
+    { "fs_cp_pfcode_is_oem_mb_char_16.0.0+",         "0x08..........................00....078052......7A",                      0, FsBlobImpl::IsOemMbChar },
+    { "fs_cp_pfcode_is_oem_mb_char_10.0.0-11.0.1",   "0x0A1C00135F0100710B1C001208000151",                                      0, FsBlobImpl::IsOemMbChar },
     // PFCODE_Str_Unicode2OEM → patch_str_unicode2oem（有界转换；21.x/22.x 入口在命中点后 4 字节）
-    { "fs_cp_str_unicode2oem_16.1.0-20.5.0",      "0x3F482838C0035FD600000000FF4301D1",                   12, FsBlobImpl::StrUnicode2Oem },
-    { "fs_cp_str_unicode2oem_21.0.0+",            "0x3F482838C0035FD60000000000000000FF0301D1",           16, FsBlobImpl::StrUnicode2Oem },
-    { "fs_cp_str_unicode2oem_14.1.2-15.0.1",      "0xFF4301D1FD7B01A9FD430091F71300F9F65703A9F44F04A9BF3B0079", 0, FsBlobImpl::StrUnicode2Oem },
+    { "fs_cp_str_unicode2oem_16.0.0-20.5.0",             "0x3F482838C0035FD600000000FF4301D1",                   12, FsBlobImpl::StrUnicode2Oem },
+    { "fs_cp_str_unicode2oem_21.0.0+",               "0x3F482838C0035FD60000000000000000FF0301D1",           16, FsBlobImpl::StrUnicode2Oem },
+    { "fs_cp_str_unicode2oem_12.0.0-15.0.1",             "0xFF4301D1FD7B01A9FD430091F71300F9F65703A9F44F04A9BF3B0079", 0, FsBlobImpl::StrUnicode2Oem },
+    { "fs_cp_str_unicode2oem_10.0.0-11.0.1",         "0xFF4301D1FFDF00A9F65702A9F44F03A9FD7B04A9FD030191FF3B0079........", 0, FsBlobImpl::StrUnicode2Oem },
     // StringDesc_ToUpper → patch_stringdesc_toupper（OEM 分支改 ASCII-only）
-    { "fs_cp_stringdesc_toupper_16.1.0+",         "0xFD7BBDA9F50B00F9F44F02A9FD030091081040B9",           0, FsBlobImpl::StrDescToUpper },
-    { "fs_cp_stringdesc_toupper_14.1.2-15.0.1",   "0xFD7BBDA9F50B00F9FD030091F44F02A9081040B9",           0, FsBlobImpl::StrDescToUpper },
+    //   10/11 的序言多一拍 `str x21,[sp,#-0x30]!`，12+ 没有 ⇒ 单独一条。
+    { "fs_cp_stringdesc_toupper_16.0.0+",            "0xFD7BBDA9F50B00F9F44F02A9FD030091081040B9",           0, FsBlobImpl::StrDescToUpper },
+    { "fs_cp_stringdesc_toupper_12.0.0-15.0.1",          "0xFD7BBDA9F50B00F9FD030091F44F02A9081040B9",           0, FsBlobImpl::StrDescToUpper },
+    { "fs_cp_stringdesc_toupper_10.0.0-11.0.1",      "0xF50F1DF8F44F01A9FD7B02A9FD830091081040B9........",   0, FsBlobImpl::StrDescToUpper },
 };
 
-static_assert(std::size(fs_inst_patches) == 15);
-static_assert(std::size(fs_blob_patches) == 16);
+static_assert(std::size(fs_inst_patches) == 18);
+static_assert(std::size(fs_blob_patches) == 22);
 static_assert(std::size(fs_fn_groups) == 12);
 static_assert(FS_PRED_COUNT <= 32);   // 位图挤在一个 u32 里
 
 /* 命中站点记录（仅诊断）：fs 的补丁扫描命中后把补丁位的**绝对地址**记下来，
  * 由调用方换算成「相对模块基址的偏移」写进 log.ini。只存内存不落盘 ——
  * 附加调试后 fs 是挂起的，此时任何写 SD 的操作都会永久阻塞。 */
-constexpr u32 FS_SITE_MAX = 64;   // ≥ 31 条条目（15 指令 + 16 替换），留余量
+constexpr u32 FS_SITE_MAX = 64;   // ≥ 40 条条目（18 指令 + 22 替换），留余量
 
 struct FsSiteSink {
     struct Rec { const char* name; u64 addr; };
