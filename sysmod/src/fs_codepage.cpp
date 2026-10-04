@@ -1,24 +1,22 @@
 // ============================================================================
-// fs codepage patch (fork only): replace fs's CP932 (Shift-JIS) <-> UTF-16
-// routines with UTF-8 <-> UTF-16 so FAT/exFAT entries can carry 3-byte CJK names.
+// fs codepage 补丁（独立系统模块）：
+// 把原版FS驱动的 CP932 (Shift-JIS) <-> UTF-16 功能换成 UTF-8 <-> UTF-16，
+// 让 FAT/exFAT 能承载 3 字节 UTF-8 的中日韩文件名。
 //
-// Layout: §0 named constants · §1 the 7 replacement bodies copied into fs ·
-// §2 cond/patch rewrite rules · §3 table types · §4 the tables · §5 scanners ·
-// §6 harvesting · §7 entry point and logging.
+// 布局：§0 具名常量 · §1 拷进 fs 的整函数替换体 · §2 cond/patch 改写规则 ·
+// §3 表结构 · §4 补丁表 · §5 扫描器 · §6 现场收割 · §7 入口与日志。
 //
-// Location is pattern driven, no hardcoded fs offsets: each patch point has a
-// cross-version byte pattern (".." = one wildcard byte) searched in fs .text.
-// Instruction rewrites compute their patch bytes from the matched instruction,
-// so registers / offsets / widths are inherited from the site. Every pattern
-// hits exactly once; a miss only records NOT_FOUND and writes nothing, so an
-// unvalidated firmware fails safe. tools/check_patch_sizes.py parses the tables
-// out of this source text and validates them -- keep the entry format in sync.
+// 定位全部 pattern 驱动、无硬编码 fs 偏移。
+// 每个补丁点有一条跨版本的字节模板（".." = 一个通配字节），在 fs .text 里搜索。
+// 指令改写的补丁字节由命中的指令现场算出，寄存器/偏移/宽度全部继承自位点。
+// 每条 pattern 恰好唯一命中；未命中只记 NOT_FOUND、什么都不写，
+// 未入库的固件安全失败。构建期守卫 scripts/check_patch_sizes.py 从本源码文本
+// 解析补丁表并校验 —— 条目格式须与其同步。
 //
-// ASLR: the §1 bodies are copied verbatim into fs at a randomised base, so they
-// must be position independent -- no absolute address materialisation, no literal
-// pools, no external calls, no &function. The only version-dependent values (the
-// code page context slot, one external callee) are harvested at patch time from
-// the bytes about to be overwritten via the 0xDEAD0001..4 sentinels (§6).
+// ASLR：§1 替换体会被原样拷进随机基址的 fs，必须位置无关 ——
+// 禁止物化绝对地址、字面量池、外部调用、&函数名。
+// 仅有的版本相关值（代码页上下文槽、一个外部 callee）在打补丁时收割，
+// 来源 = 即将被覆写的原函数字节（0xDEAD0001..4 哨兵，§6）。
 // ============================================================================
 
 #include <span>
@@ -38,7 +36,7 @@
 // ───────────────────────────────────────────────────────────────────────────
 
 /* fs 名字对象的「编码/宽度」选择子。它在两种对象里落在同一个槽、但极性相反。 */
-constexpr u32 ENCODE_OEM     = 1;    // StringDesc::encode_type == 1 ⇒ OEM（单字节名字）
+constexpr u32 ENCODE_OEM     = 1;    // FsString::encode_type == 1 ⇒ OEM（单字节名字）
 constexpr u16 NAME_ENC_UTF16 = 1;    // FsNameDesc16::enc == 1 ⇒ UTF-16（每次推进 2 字节）
 
 /* FAT_GetNextChar 的第二参数：决定走哪条转换路径。 */
@@ -85,17 +83,17 @@ constexpr u32 MASK8  = 0xFF;
 constexpr u32 NAME_POS_MAX_UTF16 = 0x20A;
 constexpr u32 NAME_POS_MAX_OEM   = 0xB;
 
-/* Bounded Unicode2OEM output (incl. NUL): the narrower of the two destinations
- * (lname[513] and FAT_MakeShortName's 512B stack buffer). */
+/* Unicode2OEM 的有界输出（含 NUL）：取两个目的地中较窄的那个
+ * （lname[513] 与 FAT_MakeShortName 的 512B 栈缓冲）。 */
 constexpr u32 FS_OEM_OUT_MAX    = 512;
-constexpr u32 FS_OEM_BOUND_STEP = 4;   // per-round margin: worst 3-byte char + NUL
+constexpr u32 FS_OEM_BOUND_STEP = 4;   // 每轮余量：最坏 3 字节字符 + NUL
 
-/* isOEMMBchar: >= 4 extra bytes is invalid (UTF-8 has at most 3 continuations). */
+/* isOEMMBchar：额外字节数 >= 4 即非法（UTF-8 至多 3 个续字节）。 */
 constexpr u32 FS_UTF8_EXTRA_MAX = 4;
-constexpr u32 BYTE_TOP_BITS     = 24;  // move one byte to the top of a u32 (for clz)
+constexpr u32 BYTE_TOP_BITS     = 24;  // 把一个字节移到 u32 顶部（供 clz 用）
 
-/* Packed return value of the converters: high half = bytes out, low half = bytes
- * in, same as the stock CP932 `mov w0,#len; mov w1,#2; b ConvertWidth`. */
+/* 转换器的打包返回值：高半 = 输出字节数，低半 = 输入字节数，与原版 CP932 的
+ * `mov w0,#len; mov w1,#2; b ConvertWidth` 同构。 */
 constexpr u32 FS_CONV_OUT_SHIFT = 16;
 constexpr u32 FS_IN_BYTES_UTF16 = 2;
 
@@ -103,13 +101,11 @@ constexpr u32 FS_IN_BYTES_UTF16 = 2;
 constexpr u32 PAT_STAR = '*';
 constexpr u32 PAT_QUES = '?';
 
-/* 名字比较值里各字节的移位（24 位单射值：b0 | b1<<8 | b2<<16）。原版最远只到第 2 字节。 */
-constexpr u32 NAME_BYTE1_SHIFT = 8;
+/* 名字比较值里第 3 字节的移位（24 位单射值：b0 | b1<<8 | b2<<16）。 */
 constexpr u32 NAME_BYTE2_SHIFT = 16;
 
-/* Harvest sentinels: unique, adjacent, in order (the guard matches them by value).
- * Macros, not constexpr: they also appear inside `.inst` asm strings, which are
- * stringified by FS_ASM_STR() -- C++ string literals are not macro expanded. */
+/* 收割哨兵：唯一、相邻、有序（守卫按值匹配）。用宏而非 constexpr：它们还出现在
+ * `.inst` 汇编串里、经 FS_ASM_STR() 字符串化 —— C++ 字符串字面量不做宏展开。 */
 #define FS_CTX_SENTINEL_A  0xDEAD0001
 #define FS_CTX_SENTINEL_B  0xDEAD0002
 #define FS_CALL_SENTINEL_A 0xDEAD0003
@@ -117,36 +113,33 @@ constexpr u32 NAME_BYTE2_SHIFT = 16;
 #define FS_ASM_STR_(x) #x
 #define FS_ASM_STR(x)  FS_ASM_STR_(x)
 
-// §1 Replacement bodies copied into fs. Each sits in its own .text.<name>
-// section followed by a <name>_end label; size = label delta, checked by the
-// build-time guard.
+// §1 拷进 fs 的替换体。各自独占 .text.<name> 段、后随 <name>_end 标签；
+// 尺寸 = 标签差，由构建期守卫校验。
 
-/* The lightweight object view fs hands to the replaced functions: StringDesc,
- * the char iterator and the pattern stream all share this layout (+0x00 / +0x08
- * pointers, +0x10 encode/width selector), so one definition is enough. +0x14 is
- * declared explicitly to keep the struct at 24B with no tail padding, so copying
- * a whole *ps is a fixed size regardless of compiler padding rules. */
+/* fs 交给被替换函数的轻量对象视图：
+ * FsString、字符迭代器、pattern 流共享同一布局（+0x00 / +0x08 指针，
+ * +0x10 编码/宽度选择子），一份定义即可。
+ * +0x14 显式声明，把结构体钉在 24B、无尾部填充，
+ * 整体拷贝 *ps 的尺寸与编译器填充规则无关。 */
 typedef struct {
     void *ptr_left;    /* +0x00  左指针 / 游标 cur */
     void *ptr_right;   /* +0x08  右指针 / 末尾 end */
     u32   encode_type; /* +0x10  ENCODE_OEM / 宽度（== 1 ⇒ 单字节读） */
-    u32   reserved;    /* +0x14  原 StringDesc 保留字段，本实现不碰 */
-} StringDesc;
+    u32   reserved;    /* +0x14  原 FsString 保留字段，本实现不碰 */
+} FsString;
 
-static_assert(sizeof(StringDesc) == 24, "StringDesc must be 24 bytes (shared by three fs views)");
-static_assert(offsetof(StringDesc, ptr_left) == 0x00 && offsetof(StringDesc, ptr_right) == 0x08
-              && offsetof(StringDesc, encode_type) == 0x10 && offsetof(StringDesc, reserved) == 0x14,
-              "StringDesc field offsets (ptr_left/ptr_right/encode_type/reserved)");
+static_assert(sizeof(FsString) == 24, "FsString must be 24 bytes (shared by three fs views)");
+static_assert(offsetof(FsString, ptr_left) == 0x00 && offsetof(FsString, ptr_right) == 0x08
+              && offsetof(FsString, encode_type) == 0x10 && offsetof(FsString, reserved) == 0x14,
+              "FsString field offsets (ptr_left/ptr_right/encode_type/reserved)");
 
 extern "C" {
-// Continuation byte check: the 3/4-byte branches must confirm in[1..3] really are
-// continuations (10xxxxxx) -- protects against reading past a truncated path and
-// against stepping out of sync with the caller.
+// 续字节检查：3/4 字节分支必须确认 in[1..3] 真是续字节（10xxxxxx）——
+// 防止在截断路径上越界读，也防止与调用方的步进失步。
 static inline bool utf8_cont_ok(u8 b) { return (b & UTF8_CONT_MASK) == UTF8_CONT_PREFIX; }
 
-// UTF-8 -> UTF-16, one character. Returns (bytes in << 16) | UTF-16 bytes out.
-// Invalid input becomes '_'; 4-byte sequences (U+10000+, needs surrogates) are
-// not supported and also become '_'.
+// UTF-8 -> UTF-16，单字符。返回（输入字节数 << 16）| UTF-16 字节数。
+// 非法输入输出 '_'；4 字节序列（U+10000+，需代理对）不支持，同样输出 '_'。
 __attribute__((used, section(".text.patch_utf8_to_utf16")))
 static int patch_utf8_to_utf16(const u8 *utf8_in, u16 *utf16_out) {
     u32 cp = 0;
@@ -193,14 +186,13 @@ __asm__(".section .text.patch_utf8_to_utf16,\"ax\",@progbits\n\t.global patch_ut
 }
 
 extern "C" {
-// UTF-16 -> UTF-8, one character (1..3 bytes). Returns (utf8_len << 16) | 2.
+// UTF-16 -> UTF-8，单字符（1..3 字节）。返回 (utf8_len << 16) | 2。
 //
-// All three branches fill [0..2], and the NUL landing spot of the short branches
-// is a bit-exact constraint: stock writes `strb wT,[x1]` + `strb wzr,[x1,#1]`
-// (NUL at [1]) on the 1-byte path, so writing only [2] would leave a stale byte
-// in [1]. Hence the 1/2-byte branches add a NUL at [1] / [2].
-// 3-byte output is the inherent cost of this fork: every caller going through
-// ctx[UNI2OEM] must have room for 3 bytes (it advances by the high half).
+// 三个分支都写满 [0..2]，短分支的 NUL 落点是逐位约束。
+// 原版 1 字节路径写 `strb wT,[x1]` + `strb wzr,[x1,#1]`（NUL 落在 [1]），
+// 若只写 [2] 会在 [1] 留下残留字节，因此 1/2 字节分支在 [1] / [2] 各补一个 NUL。
+// 3 字节输出是本补丁的固有代价：
+// 所有经 ctx[UNI2OEM] 的调用方必须容得下 3 字节（调用方按高半推进）。
 __attribute__((used, section(".text.patch_utf16_to_utf8")))
 static int patch_utf16_to_utf8(const u16 *utf16_in, u8 *utf8_output)
 {
@@ -209,7 +201,7 @@ static int patch_utf16_to_utf8(const u16 *utf16_in, u8 *utf8_output)
 
     if (utf16_char <= UTF16_1B_MAX) {
         utf8_output[0] = (uint8_t)utf16_char;
-        utf8_output[1] = '\0';      /* as stock: the short branch's NUL is at [1] */
+        utf8_output[1] = '\0';      /* 同原版：短分支的 NUL 落在 [1] */
         utf8_output[2] = '\0';
         utf8_len = 1;
     } else if (utf16_char <= UTF16_2B_MAX) {
@@ -220,7 +212,7 @@ static int patch_utf16_to_utf8(const u16 *utf16_in, u8 *utf8_output)
     } else {
         utf8_output[0] = UTF8_3B_PREFIX | (uint8_t)(utf16_char >> 12);
         utf8_output[1] = UTF8_CONT_PREFIX | (uint8_t)((utf16_char >> 6) & UTF8_PAYLOAD_6);
-        utf8_output[2] = UTF8_CONT_PREFIX | (uint8_t)(utf16_char & UTF8_PAYLOAD_6);  /* not NUL */
+        utf8_output[2] = UTF8_CONT_PREFIX | (uint8_t)(utf16_char & UTF8_PAYLOAD_6);  /* 非 NUL */
         utf8_len = 3;
     }
 
@@ -231,21 +223,20 @@ __asm__(".section .text.patch_utf16_to_utf8,\"ax\",@progbits\n\t.global patch_ut
 }
 
 extern "C" {
-// isOEMMBchar replacement. byte_idx selects the meaning (as stock CP932 does):
-// the lead byte asks "how many bytes follow" (used for stepping), the second byte
-// only asks "is this a valid UTF-8 continuation" (used to validate a multibyte
-// char). For 0xC0..0xFF the extra count is (leading ones - 1), computed with one
-// clz so it fits the 0x50 hole.
-// There is no explicit `c < 0xC0` test: it folds into the unsigned compare below
-// (c < 0xC0 gives extra <= 0, i.e. a huge unsigned value; c >= 0xF8 gives >= 4).
-// Size limit: 0x50 (the hole ends where a callback-referenced stub begins).
+// isOEMMBchar 替换。byte_idx 决定语义（与原版 CP932 相同）：
+// 首字节问「后面还有几个字节」（用于步进），
+// 第二字节只问「是不是合法 UTF-8 续字节」（用于校验多字节字符）。
+// 0xC0..0xFF 的额外字节数 =（前导 1 的个数 − 1），用一条 clz 算出，才塞得进 0x50 的洞。
+// 无显式 `c < 0xC0` 测试：它折叠进下面的无符号比较
+// （c < 0xC0 给出 extra <= 0，即巨大的无符号值；c >= 0xF8 给出 >= 4）。
+// 尺寸上限：0x50（洞的尽头是回调表引用的桩函数）。
 __attribute__((used, section(".text.patch_is_oem_mb_char")))
 static int patch_is_oem_mb_char(u8 ch, int byte_idx)
 {
     const unsigned c = ch;
 
     if (byte_idx != FS_MBLEN_LEAD) {
-        /* second byte: >>6 == 0b10 (one instruction less than and+cmp) */
+        /* 第二字节：>>6 == 0b10（比 and+cmp 少一条指令） */
         return (byte_idx == FS_MBLEN_TRAIL) && ((c >> 6) == (UTF8_CONT_PREFIX >> 6));
     }
     const int extra = __builtin_clz(((~c) & MASK8) << BYTE_TOP_BITS) - 1;
@@ -256,18 +247,16 @@ __asm__(".section .text.patch_is_oem_mb_char,\"ax\",@progbits\n\t.global patch_i
 }
 
 extern "C" {
-// Bounded Unicode -> OEM string conversion. Stock has no output limit and
-// overflows at >= 171 CJK characters once UTF-8 is in play; this keeps the whole
-// write (trailing NUL included) inside FS_OEM_OUT_MAX bytes.
-// The bound must be checked against the worst-case character width: each round
-// reserves "3 bytes + NUL", so the final NUL always lands in bounds. Checking
-// only `out < limit` is not enough -- byte-at-a-time writes overshoot by 1..2.
-// The leading sentinel pair is a placeholder for the ctx slot, harvested at patch
-// time (§6); if that fails the point is not written at all.
-// Normal mode inlines UTF-16 -> UTF-8; special-mapping mode compares u16 directly.
-// Always returns 0, as stock does. Size limit: 0x120 (next fs function follows).
-__attribute__((used, section(".text.patch_str_unicode2oem")))
-static int patch_str_unicode2oem(char *dst_oem, const u16 *src_uni)
+// 有界 Unicode -> OEM 字符串转换。原版无输出上限，
+// 换 UTF-8 后 CJK 字符到 171 个就会溢出；
+// 本实现把整次写入（含结尾 NUL）限制在 FS_OEM_OUT_MAX 字节内。
+// 上界必须按最坏字符宽度检查：每轮预留「3 字节 + NUL」，结尾 NUL 必然落在界内。
+// 只查 `out < limit` 不够 —— 逐字节写会越界 1..2 字节。
+// 开头的哨兵对是 ctx 槽占位，打补丁时现场收割（§6）；收割失败则该点整点不写。
+// 普通模式内联 UTF-16 -> UTF-8；特殊映射模式直接按 u16 比较。
+// 恒返回 0，与原版一致。尺寸上限：0x120（下一个 fs 函数紧随其后）。
+__attribute__((used, section(".text.patch_str_utf16_to_utf8")))
+static int patch_str_utf16_to_utf8(char *dst_oem, const u16 *src_uni)
 {
     const u8 *ctx;
     __asm__ volatile(
@@ -278,17 +267,17 @@ static int patch_str_unicode2oem(char *dst_oem, const u16 *src_uni)
         :
         : "x3");
     u8 *out = (u8 *)dst_oem;
-    u8 *const limit = out + FS_OEM_OUT_MAX;     /* available bytes, NUL included */
+    u8 *const limit = out + FS_OEM_OUT_MAX;     /* 可用字节数，含 NUL */
     const u16 *in = src_uni;
 
     if (ctx[FS_CTX_FLAGS] & FS_CTX_FLAG_SPECIAL) {
-        /* special mapping mode: '.' -> '.', ' ' -> ' ', anything else -> '_' */
+        /* 特殊映射模式：'.' -> '.'、' ' -> ' '，其余 -> '_' */
         while (*in != 0 && (u32)(limit - out) >= FS_OEM_BOUND_STEP) {
             const u16 c = *in++;
             *out++ = (c == '.') ? '.' : ((c == ' ') ? ' ' : '_');
         }
     } else {
-        /* normal mode: inlined UTF-16 -> UTF-8 (1..3 bytes per character) */
+        /* 普通模式：内联 UTF-16 -> UTF-8（每字符 1..3 字节） */
         while (*in != 0 && (u32)(limit - out) >= FS_OEM_BOUND_STEP) {
             const u16 c = *in++;
             if (c <= UTF16_1B_MAX) {
@@ -303,20 +292,21 @@ static int patch_str_unicode2oem(char *dst_oem, const u16 *src_uni)
             }
         }
     }
-    *out = '\0';                                /* out <= limit-1, so in bounds */
+    *out = '\0';                                /* out <= limit-1，必在界内 */
     return 0;
 }
 
-__asm__(".section .text.patch_str_unicode2oem,\"ax\",@progbits\n\t.global patch_str_unicode2oem_end\npatch_str_unicode2oem_end:\n\t.previous");
+__asm__(".section .text.patch_str_utf16_to_utf8,\"ax\",@progbits\n\t.global patch_str_utf16_to_utf8_end\npatch_str_utf16_to_utf8_end:\n\t.previous");
 }
 
 extern "C" {
-// StringDesc_ToUpper replacement: the OEM branch becomes ASCII-only (only 'a'-'z'
-// are uppercased, other bytes pass through -- stock feeds high bytes to a ctype
-// table as signed char, which is UB). The Unicode branch matches stock verbatim.
-// Size limit: 0xB0 (smallest hole measured across firmware variants).
-__attribute__((used, section(".text.patch_stringdesc_toupper")))
-static void patch_stringdesc_toupper(StringDesc *path, short maxLen, char *dst)
+// FsString_ToUpper 替换：OEM 分支改为 ASCII-only
+// （只大写 'a'-'z'，其余字节原样透传；
+//   原版把高位字节当 signed char 喂进 ctype 表，是未定义行为）。
+// Unicode 分支与原版逐位一致。
+// 尺寸上限：0xB0（各固件变体实测的最小洞）。
+__attribute__((used, section(".text.patch_fsstring_toupper")))
+static void patch_fsstring_toupper(FsString *path, short maxLen, char *dst)
 {
     if (path->encode_type != ENCODE_OEM) {
         u16 *p = (u16 *)path->ptr_left;
@@ -351,50 +341,41 @@ static void patch_stringdesc_toupper(StringDesc *path, short maxLen, char *dst)
     }
 }
 
-__asm__(".section .text.patch_stringdesc_toupper,\"ax\",@progbits\n\t.global patch_stringdesc_toupper_end\npatch_stringdesc_toupper_end:\n\t.previous");
+__asm__(".section .text.patch_fsstring_toupper,\"ax\",@progbits\n\t.global patch_fsstring_toupper_end\npatch_fsstring_toupper_end:\n\t.previous");
 }
 
 extern "C" {
-/* WideChar_Compare whole-function replacement: folds the 15 instruction patch
- * points scattered through the stock function into one implementation -- encoding
- * aware wide-char wildcard matching ('*' / '?') with recursive backtracking.
+/* WideChar_Compare 整函数替换：编码感知的宽字符通配符匹配（'*' / '?'），带回溯递归。
  *
- * Object layout (derived from the callers, confirmed by differential testing):
- *   FsNameDesc16 = {u64 data; u16 enc; u16 pos; u32 pad} (16B, x1)
- *     enc == 1 -> UTF-16 (pos advances by 2), else OEM (by 1); pos is the byte
- *     offset past the current character, data is the raw buffer.
- *   StringDesc (pattern stream view, x3): ptr_left/ptr_right are cursor and end,
- *     encode_type is the width selector -- a different object with the same shape.
- *   The caller advances the name desc once and folds the current name character
- *   before fetching the first pattern character.
+ * 对象布局（由调用方反推，差分测试确认）：
+ *   FsNameDesc16 = {u64 data; u16 enc; u16 pos; u32 pad}（16B，x1）
+ *     enc == 1 → UTF-16（pos 每次进 2），否则 OEM（进 1）；
+ *     pos = 越过当前字符后的字节偏移，data = 原始缓冲。
+ *   FsString（pattern 流视图，x3）：ptr_left/ptr_right 是游标与末尾，
+ *     encode_type 是宽度选择子 —— 另一个对象、同一形状。
+ *   调用方先把名字描述推进一次、折叠当前名字字符，再取第一个 pattern 字符。
  *
- * Semantic target: stock behaviour x the 24-bit comparison value intent (not a
- * bit-exact dual of those 15 patches). Two stock quirks must be reproduced: the
- * +FULLWIDTH_FOLD_OFFSET fullwidth fold test and the OEM name buffer bound. The
- * one deliberate divergence is the ASCII fold spelling (see fold_ascii_upper).
- * Both sentinel pairs are harvested at patch time (§6); on failure the point is
- * left alone, so the sentinels never execute. They are matched by content (a
- * adjacent, in order), not by position. Self recursion uses a PC-relative bl,
- * which stays valid after the body is copied.
- * Size limit: 0x360 (smallest of the three firmware shapes). */
+ * 语义目标：原版行为 × 24 位比较值的设计意图（不是那 15 个补丁的逐位对偶）。
+ * 必须复现两个原版怪癖：+FULLWIDTH_FOLD_OFFSET 的全角折叠测试、OEM 名字缓冲上界。
+ * 唯一刻意分歧是 ASCII 折叠的写法（见 fold_ascii_upper）。
+ * 两对哨兵都在打补丁时现场收割（§6）；失败则该点不动，哨兵永远不会执行。
+ * 按**内容**匹配（相邻、有序），不按位置。自递归用 PC 相对 bl，拷贝后依然有效。
+ * 尺寸上限：0x360（三种固件形态里最小的洞）。 */
 typedef struct { u64 data; u16 enc; u16 pos; u32 pad; } FsNameDesc16;   /* 16 B */
-typedef u32 (*FsNextChar)(StringDesc *, u32);                          /* pattern reader (harvested) */
+typedef u32 (*FsNextChar)(FsString *, u32);                          /* pattern 读字符回调（收割） */
 
-/* ASCII lower -> upper (idempotent on already-upper values). Name side and
- * pattern side must use the same form or they never compare equal.
- * Deliberately not stock's `mov wT,#0xffe0; add`: that only equals `sub #0x20`
- * because the 16-bit comparison drops the carry. This compares 32 bits, so it
- * must subtract without a carry, otherwise it reproduces the bug of the old
- * 15-point patch (OEM single-byte names failed to match lowercase in the '*'
- * backtracking path). */
+/* ASCII 小写 -> 大写（已是大写则原样）。名字侧与 pattern 侧必须同形，否则永不相等。
+ * 刻意不用原版的 `mov wT,#0xffe0; add`：
+ * 那只在 16 位比较丢弃进位时才等价于 `sub #0x20`；
+ * 本处是 32 位比较，必须真正做减法（进位会污染比较值）。 */
 __attribute__((always_inline)) static inline u32 fold_ascii_upper(u32 c)
 {
     return ((c - 'a') < ASCII_ALPHA_LEN) ? (c - ASCII_CASE_BIT) : c;
 }
 
-/* Name character normalisation: ASCII lower -> upper, then fullwidth lower ->
- * halfwidth upper. The & MASK16 is stock's own (fullwidth 'a' + FULLWIDTH_FOLD_OFFSET
- * == 0x10000, masked down to 0 means "fold"). */
+/* 名字字符归一化：ASCII 小写 -> 大写，再全角小写 -> 半角大写。
+ * & MASK16 是原版自带的（全角 'a' + FULLWIDTH_FOLD_OFFSET == 0x10000，
+ * 掩掉后为 0 即「命中折叠」）。 */
 __attribute__((always_inline)) static inline u32 wc_fold2(u32 c)
 {
     c = fold_ascii_upper(c);
@@ -402,36 +383,34 @@ __attribute__((always_inline)) static inline u32 wc_fold2(u32 c)
     return c;
 }
 
-/* fs multibyte length callback: ctx[MBLEN](lead, 1) -> number of trailing bytes
- * (0 = single byte). One of only two dependencies on the fs context (the other is
- * the harvested pattern character callee). */
+/* fs 多字节长度回调：ctx[MBLEN](lead, 1) -> 后续字节数（0 = 单字节）。
+ * 本实现对 fs 上下文仅有的两处依赖之一（另一处是收割来的 pattern 读字符回调）。 */
 __attribute__((always_inline)) static inline u32 wc_mb_len(const u8 *ctx, u32 lead)
 {
     return (*(u32 (*)(u32, u32))(*(const void **)(ctx + FS_CTX_MBLEN)))(lead, 1u);
 }
 
-/* Read the next name-stream character and advance the desc; 0 when exhausted.
- * Returns the folded comparison value:
- *   UTF-16: read 2 bytes, both fold stages;
- *   OEM: read 1 byte, and if fs calls it a multibyte lead read 2 more to build the
- *        24-bit value (no 2-byte truncation collisions); ASCII fold only.
- * The bounds match stock: one more advance (2/1 bytes) would pass the name buffer. */
+/* 读名字流下一个字符并推进描述；耗尽返回 0。返回折叠后的比较值：
+ *   UTF-16：读 2 字节，过两道折叠；
+ *   OEM：读 1 字节，若 fs 判它是多字节首字节再读 2 字节拼 24 位值
+ *        （避免 2 字节截断碰撞）；只做 ASCII 折叠。
+ * 上界与原版一致：再推进一次（2/1 字节）就越过名字缓冲。 */
 __attribute__((always_inline)) static inline u32 wc_next_name_char(FsNameDesc16 *d, const u8 *ctx)
 {
     u8 *p = (u8 *)d->data;
     const u32 pos = d->pos;
 
-    if (d->enc == NAME_ENC_UTF16) {                  /* UTF-16: 2 bytes per step */
+    if (d->enc == NAME_ENC_UTF16) {                  /* UTF-16：每次进 2 字节 */
         if (pos > NAME_POS_MAX_UTF16) { return 0u; }
         const u32 c = *(const u16 *)(p + pos);
         d->pos = (u16)(pos + 2);
         return wc_fold2(c);
     }
-    if (pos > NAME_POS_MAX_OEM) { return 0u; }       /* OEM: 1 byte to start */
+    if (pos > NAME_POS_MAX_OEM) { return 0u; }       /* OEM：先读 1 字节 */
     u32 c = p[pos];
     d->pos = (u16)(pos + 1);
     const u32 n = wc_mb_len(ctx, c);
-    if (n != 0u) {                                   /* multibyte: eat 2 more, build 24 bits */
+    if (n != 0u) {                                   /* 多字节：再吃 2 字节、拼 24 位值 */
         c = ((u32)*(const u16 *)(p + pos + 1)) | (c << NAME_BYTE2_SHIFT);
         d->pos = (u16)(pos + 1 + n);
     }
@@ -441,7 +420,7 @@ __attribute__((always_inline)) static inline u32 wc_next_name_char(FsNameDesc16 
 __attribute__((noinline, used, optimize("Os"),
                section(".text.patch_widechar_compare")))
 static u32 patch_widechar_compare(u32 name_char, FsNameDesc16 *nd,
-                                  u32 pat_char, StringDesc *ps)
+                                  u32 pat_char, FsString *ps)
 {
     const u8 *ctxp;
     FsNextChar nx;
@@ -457,30 +436,28 @@ static u32 patch_widechar_compare(u32 name_char, FsNameDesc16 *nd,
         : "x3", "x9");
     const u8 *ctx = *(const u8 *const *)ctxp;
 
-    /* Main loop. Invariant: name_char is the current name character (already folded
-     * by the caller; low 16 bits zero = name exhausted), pat_char the current
-     * pattern character (0 = pattern exhausted). */
+    /* 主循环。不变量：name_char 是当前名字字符（调用方已折叠；低 16 位为 0 = 名字已尽），
+     * pat_char 是当前 pattern 字符（0 = pattern 已尽）。 */
     for (;;) {
         if (pat_char == PAT_QUES) {
-            /* '?': matches any one character, but the name must still have one. */
+            /* '?'：匹配任意一个字符，但名字必须还有剩 */
             if ((name_char & MASK16) == 0u) { return 0u; }
         } else if (pat_char == 0u) {
-            return (name_char & MASK16) == 0u;      /* pattern done: match if name is too */
+            return (name_char & MASK16) == 0u;      /* pattern 尽：名字也尽才算匹配 */
         } else if (pat_char == PAT_STAR) {
-            /* '*': swallow a run of '*'/'?', stopping at the first normal character
-             * or the end (nx still advances ps, as stock does); then try that
-             * character against every remaining name position. */
+            /* '*'：吞掉连续的 '*'/'?'，停在第一个普通字符或末尾（nx 照样推进 ps，同原版）；
+             * 再拿该字符去试名字的每个剩余位置。 */
             do {
                 pat_char = nx(ps, nd->enc);
             } while (pat_char == PAT_STAR || pat_char == PAT_QUES);
-            if (pat_char == 0u) { return 1u; }               /* trailing '*': matches all */
-            if ((name_char & MASK16) == 0u) { return 0u; }   /* name exhausted after '*' */
+            if (pat_char == 0u) { return 1u; }               /* 尾随 '*'：匹配一切 */
+            if ((name_char & MASK16) == 0u) { return 0u; }   /* '*' 之后名字已尽 */
             const u32 target = pat_char;
             for (;;) {
                 if (name_char == target) {
-                    /* hit: recurse on a copy (nd/ps untouched, so failure can back out) */
+                    /* 命中：在副本上递归（nd/ps 不动，失败可回退） */
                     FsNameDesc16 nd2 = *nd;
-                    StringDesc   ps2 = *ps;
+                    FsString   ps2 = *ps;
                     const u32 next_name = wc_next_name_char(&nd2, ctx);
                     const u32 next_pat  = nx(&ps2, nd->enc);
                     if (patch_widechar_compare(next_name, &nd2, next_pat, &ps2) != 0u) {
@@ -491,9 +468,9 @@ static u32 patch_widechar_compare(u32 name_char, FsNameDesc16 *nd,
                 if ((name_char & MASK16) == 0u) { return 0u; }
             }
         } else if (name_char != pat_char) {
-            return 0u;                              /* normal character: exact 24-bit compare */
+            return 0u;                              /* 普通字符：精确 24 位比较 */
         }
-        name_char = wc_next_name_char(nd, ctx);      /* consumed one character: advance both */
+        name_char = wc_next_name_char(nd, ctx);      /* 消耗一个字符：两侧各推进一次 */
         pat_char = nx(ps, nd->enc);
     }
 }
@@ -501,40 +478,35 @@ static u32 patch_widechar_compare(u32 name_char, FsNameDesc16 *nd,
 __asm__(".section .text.patch_widechar_compare,\"ax\",@progbits\n\t.global patch_widechar_compare_end\npatch_widechar_compare_end:\n\t.previous");
 }
 
-/* FAT_GetNextChar whole-function replacement: folds the 4 adjacent instruction
- * patch points of the stock function into one implementation. It fetches the next
- * name-stream character and folds it into a comparison value. The four fold points
- * are: step #1 -> runtime width n; ldrb -> ldrh; strb -> sturh; lsl #8 -> lsl #16
- * (to build the 24-bit value and avoid 2-byte truncation collisions).
- * Feasible because the function has no bl; its only external dependency is the fs
- * code page context slot -- all three callbacks are `ldr xN,[ctx,#off]` + `blr xN`,
- * so harvesting the slot repoints them at the replaced converters (same slot as
- * WideChar_Compare harvests).
- * Differential discipline: the goal is bit-equivalence with "all 4 instruction
- * patches applied", not "written better" -- stock quirks (fullwidth fold test,
- * rev+lsr byte swap, the two separate csel folds, the double-byte empty test) are
- * reproduced as-is.
- * Size limit: 0x240 (smallest hole measured across firmware variants). */
+/* FAT_GetNextChar 整函数替换：把原版相邻的 4 个指令补丁点折叠成一个实现。
+ * 取名字流下一个字符并折叠成比较值。
+ * 四个折叠点：步进 #1 -> 运行期宽度 n；ldrb -> ldrh；strb -> sturh；
+ * lsl #8 -> lsl #16（拼 24 位值、避免 2 字节截断碰撞）。
+ * 可行原因：该函数无 bl；唯一外部依赖是 fs 代码页上下文槽 ——
+ * 三个回调都是 `ldr xN,[ctx,#off]` + `blr xN`，
+ * 收割槽地址后即把回调重定向到替换后的转换器（与 WideChar_Compare 收割同一个槽）。
+ * 差分纪律：目标 = 与「4 个指令补丁全部打上」逐位等价，不是「写得更好」——
+ * 原版怪癖（全角折叠测试、rev+lsr 字节交换、两处独立的 csel 折叠、双字节空测试）原样复现。
+ * 尺寸上限：0x240（各固件变体实测的最小洞）。 */
 
-/* ctx callback signatures (`ldr xN,[ctx,#off]` + `blr xN`, correct once harvested). */
+/* ctx 回调签名（`ldr xN,[ctx,#off]` + `blr xN`，收割后即正确）。 */
 typedef void (*FsConvert)(const void *src, void *dst);
 typedef u32 (*FsMbLen)(u32 lead, u32 one);
 
-/* Fullwidth lower -> halfwidth upper (same test as the second stage of wc_fold2). */
+/* 全角小写 -> 半角大写（与 wc_fold2 的第二道折叠同一测试）。 */
 __attribute__((always_inline)) static inline u32 gnc_fold_full(u32 c)
 {
     return (((c + FULLWIDTH_FOLD_OFFSET) & MASK16) < ASCII_ALPHA_LEN) ? (c - ASCII_CASE_BIT) : c;
 }
 
-/* patch_fat_getnextchar / patch_widechar_compare live inside extern "C" blocks:
- * the build-time guard looks them up in the ELF by their unmangled names
- * (patch_* / *_end), and C++ linkage would mangle a static function. (extern "C"
- * cannot be combined with static in one declaration, hence the block form.) */
+/* patch_fat_getnextchar / patch_widechar_compare 放在 extern "C" 块里：
+ * 构建期守卫按**未修饰名**（patch_* / *_end）在 ELF 里找符号，
+ * C++ 修饰会让 static 函数找不到。
+ * （extern "C" 不能与 static 同写在一条声明里，故用块形式。） */
 extern "C" {
 
-/* Stack slots of the original frame (sp == st; x29 = sp + 0x10, so x29 - 4 ==
- * st + FS_ST_RET). The conversion callbacks read and write these, so they must
- * really exist on the stack -- always accessed through a pointer. */
+/* 原始栈帧的槽位（sp == st；x29 = sp + 0x10，故 x29 − 4 == st + FS_ST_RET）。
+ * 转换回调会读写这些槽，所以它们必须真实存在于栈上 —— 一律经指针访问。 */
 constexpr u32 FS_ST_PAIR    = 0x0;   /* 路径 D：OEM→Unicode 转换的输出（u16） */
 constexpr u32 FS_ST_CHAR    = 0x4;   /* 字符缓冲：3 字节 + 1 字节对齐 */
 constexpr u32 FS_ST_OEM2UNI = 0x8;   /* 路径 C：Unicode→OEM 转换的输出（u16） */
@@ -543,10 +515,10 @@ constexpr u32 FS_ST_SIZE    = 0x10;  /* 帧大小（x29 = sp + 帧大小） */
 
 __attribute__((noinline, used, optimize("Os"),
                section(".text.patch_fat_getnextchar")))
-static u32 patch_fat_getnextchar(StringDesc *d, u32 enc)
+static u32 patch_fat_getnextchar(FsString *d, u32 enc)
 {
-    /* Sentinel pair (ctx slot address -- the only version-dependent value here) is
-     * harvested at patch time (§6); if it fails nothing is written. */
+    /* 哨兵对（ctx 槽地址 —— 此处唯一版本相关值）打补丁时现场收割（§6）；
+     * 收割失败则什么都不写。 */
     const u8 *ctxp;
     __asm__ volatile(
         ".inst " FS_ASM_STR(FS_CTX_SENTINEL_A) "\n\t"
@@ -572,18 +544,17 @@ static u32 patch_fat_getnextchar(StringDesc *d, u32 enc)
     bool folded = false;
 
     if (d->encode_type == ENCODE_OEM) {
-        /* single-byte names (OEM / UTF-8) */
+        /* 单字节名字（OEM / UTF-8） */
         const u8 *p = (const u8 *)cur;
         d->ptr_left = (void *)(cur + 1);
         c = *p;
         chr[1] = 0;
         chr[0] = (u8)c;
-        if (c == 0u) { return 0u; }                        /* end of name */
-        if ((u64)d->ptr_right < cur + 1) { return 0u; }    /* out of bounds */
+        if (c == 0u) { return 0u; }                        /* 名字已尽 */
+        if ((u64)d->ptr_right < cur + 1) { return 0u; }    /* 越界 */
         const u32 n = ((FsMbLen)*(const void **)(ctx + FS_CTX_MBLEN))(c, 1u);
         if (n != 0u) {
-            /* fold point: step by n, 2-byte access, 24-bit value (stock only had
-             * room for CP932's two bytes). */
+            /* 折叠点：按 n 步进、2 字节访问、拼 24 位值（原版只装得下 CP932 的两个字节）。 */
             const u32 hi = *(const u16 *)(p + 1);
             d->ptr_left = (void *)(cur + 1 + n);
             *(u16 *)(chr + 1) = (u16)hi;
@@ -591,23 +562,23 @@ static u32 patch_fat_getnextchar(StringDesc *d, u32 enc)
         }
         *out = (u16)c;
         if (e16 == FS_ENC_OEM2UNI) {
-            /* path A: OEM -> Unicode, fold, return */
+            /* 路径 A：OEM -> Unicode，折叠后返回 */
             ((FsConvert)*(const void **)(ctx + FS_CTX_OEM2UNI))(chr, out);
             return gnc_fold_full(fold_ascii_upper(*out));
         }
     } else {
-        /* 2-byte names (UTF-16) */
+        /* 2 字节名字（UTF-16） */
         const u32 v = *(const u16 *)cur;
         chr[0] = (u8)v;
         chr[1] = (u8)(v >> 8);
         chr[2] = 0;
         d->ptr_left = (void *)(cur + 2);
-        if (((v | (v >> 8)) & MASK8) == 0u) { return 0u; }   /* NUL read */
+        if (((v | (v >> 8)) & MASK8) == 0u) { return 0u; }   /* 读到 NUL */
         if ((u64)d->ptr_right < cur + 2) { return 0u; }
         c = v & MASK16;
         *out = (u16)c;
         if (e16 == FS_ENC_UNI2OEM) {
-            /* path C: Unicode -> OEM, then ask how long that OEM sequence is */
+            /* 路径 C：Unicode -> OEM，再问该 OEM 序列多长 */
             ((FsConvert)*(const void **)(ctx + FS_CTX_UNI2OEM))(out, st + FS_ST_OEM2UNI);
             const u32 r32 = __builtin_bswap32(*(const u16 *)(st + FS_ST_OEM2UNI));
             *(u16 *)(st + FS_ST_OEM2UNI) = (u16)(r32 >> 16);
@@ -622,13 +593,13 @@ static u32 patch_fat_getnextchar(StringDesc *d, u32 enc)
         }
     }
 
-    /* join point: after path C, c was recomputed and is not folded yet */
+    /* 汇合点：走完路径 C 后 c 重算过、尚未折叠 */
     if (!folded) {
         c = fold_ascii_upper(c);
         *out = (u16)c;
     }
 
-    /* path D: OEM -> Unicode -> fullwidth fold -> Unicode -> OEM -> byte swap */
+    /* 路径 D：OEM -> Unicode -> 全角折叠 -> Unicode -> OEM -> 字节交换 */
     ((FsConvert)*(const void **)(ctx + FS_CTX_OEM2UNI))(chr, st + FS_ST_PAIR);
     const u32 v0 = *(const u16 *)(st + FS_ST_PAIR);
     if ((((v0 + FULLWIDTH_FOLD_OFFSET) & MASK16) >= ASCII_ALPHA_LEN)) { return *out; }
@@ -641,9 +612,8 @@ static u32 patch_fat_getnextchar(StringDesc *d, u32 enc)
 
 __asm__(".section .text.patch_fat_getnextchar,\"ax\",@progbits\n\t.global patch_fat_getnextchar_end\npatch_fat_getnextchar_end:\n\t.previous");
 
-// Runtime size of a replacement body: own section + _end label (a link-time
-// constant distance). The guard checks "label delta == ELF st_size" and
-// "size <= hole at the patch site".
+// 替换体的运行期尺寸：独立段 + _end 标签（链接期常量距离）。
+// 守卫检查「标签差 == ELF st_size」与「尺寸 <= 位点处的洞」。
 template <typename T>
 static size_t patch_code_size(T start, const void *end)
 {
@@ -653,8 +623,8 @@ static size_t patch_code_size(T start, const void *end)
 extern "C" const u8 patch_utf8_to_utf16_end[];
 extern "C" const u8 patch_utf16_to_utf8_end[];
 extern "C" const u8 patch_is_oem_mb_char_end[];
-extern "C" const u8 patch_str_unicode2oem_end[];
-extern "C" const u8 patch_stringdesc_toupper_end[];
+extern "C" const u8 patch_str_utf16_to_utf8_end[];
+extern "C" const u8 patch_fsstring_toupper_end[];
 extern "C" const u8 patch_widechar_compare_end[];
 extern "C" const u8 patch_fat_getnextchar_end[];
 
@@ -676,17 +646,13 @@ constexpr u32 rules_setbits(u32 inst, u32 hi, u32 lo, u32 v)
 }
 
 // §2 改写规则：cond(inst) 判定「这就是要改的那类指令」，patch(inst) 现场算补丁 ——
-// 寄存器/地址/访问宽度全部继承命中现场，规则本身与固件版本、寄存器分配无关。
-
-/* 通配符里那一处 `add Rd,w25,#2` 的实测寄存器/立即数（该版本寄存器分配的定值）。 */
-constexpr u32 WC_ADD_BASE_REG = 25;   // 原指令的基址寄存器 w25
-constexpr u32 WC_ADD_IMM      = 2;    // 原立即数（CP932 双字节语义）
-constexpr u32 WC_IDX_REG      = 27;   // 已算好 idx+1 的 callee-saved 寄存器 w27
-
-/* BFI/BFM 立即数编码：immr = (32 − lsb) mod 32，imms = width − 1（width 恒 8）。 */
-constexpr u32 BFM_IMMR_LSB8  = 24;   // BFI #8,#8  → immr
-constexpr u32 BFM_IMMR_LSB16 = 16;   // BFI #16,#8 → immr
-constexpr u32 BFM_IMMS_W8    = 7;    // width 8 − 1
+// 寄存器/地址/宽度全部继承命中现场，规则本身与固件版本、寄存器分配无关。
+//
+// ★ 表里**只列仍被 fs_inst_patches[] 引用**的规则。往里加规则前先确认：
+//   对应的原版补丁点是否已经被某个整函数替换（`fs_blob_patches[]` 里的 impl）覆盖 ——
+//   若是，再打一遍指令改写会改坏那个重写后的函数。
+//   两道防线：`RULE_PATCHES` 只认表里实际用到的规则（未引用即告警），
+//   守卫另会核对落点指令是否满足 `cond`。
 
 /* FAT_MakeShortName 的拷贝宽度钳制值（防止 3 字节字符让 subs 永不归零）。 */
 constexpr u32 FS_COPY_WIDTH_CLAMP = 2;
@@ -694,16 +660,13 @@ constexpr u32 FS_COPY_WIDTH_CLAMP = 2;
 /* 该版本族在 MakeShortName 处直接写成 `movz wD,#imm`，立即数是形态指纹（不参与语义）。 */
 constexpr u32 MSN_MOVZ_SRC_IMM = 0x2E;
 
-/* AArch64 栈指针寄存器号。 */
-constexpr u32 REG_SP = 31;
-
 // #1：IDirectory_Read 的 `b.<cc> name_check_err`（不校验名字字符是否合法，
 // 否则非英文名一律被拒）-> nop
 constexpr bool rules_is_bcond(u32 inst) { return (inst & 0xFF000010u) == 0x54000000u; }
 constexpr PatchData rules_nop(u32 inst) { return PatchData{FS_NOP}; }
 
-// FAT_GetNextChar / FAT_GetNextPathComponent / 通配符三处的 `add Rd,Rn,#1`：
-// 改成 `add Rd,Rn,w0`（w0 = isOEMMBchar 返回的「额外字节数」），
+// FAT_GetNextPathComponent 的 `add Rd,Rn,#1`：改成 `add Rd,Rn,w0`
+// （w0 = isOEMMBchar 返回的「额外字节数」），
 // 使指针按 1/2/3 字节 UTF-8 字符分别前进 1/2/3 字节。
 constexpr bool rules_is_add_imm(u32 inst) { return (inst & 0x7F000000u) == 0x11000000u; }
 constexpr PatchData rules_add_imm_to_add0(u32 inst)
@@ -715,73 +678,8 @@ constexpr PatchData rules_add_imm_to_add0(u32 inst)
     return PatchData{(sf << 31) | 0x0B000000u | (rn << 5) | rd};
 }
 
-// 通配符里唯一一处 `add Rd,w25,#2`（CP932 双字节语义）：UTF-8 下需要「idx + 字符总长」，
-// 而 w27 在本处之前已算好 idx+1（callee-saved），所以改用 w27 作基址：new = (idx+1) + w0。
-constexpr bool rules_is_add_w25_2(u32 inst)
-{
-    return (inst & 0x7F000000u) == 0x11000000u &&
-           rules_bit(inst, 9, 5) == WC_ADD_BASE_REG && rules_bit(inst, 21, 10) == WC_ADD_IMM;
-}
-constexpr PatchData rules_add_w25_2_to_add_w27(u32 inst)
-{
-    return PatchData{0x0B000000u | (WC_IDX_REG << 5) | rules_bit(inst, 4, 0)};
-}
-
-// ldrb -> ldrh：把比较值从单字节扩到 16 位（后续再 orr 到高字节），
-// 与 FAT_GetNextChar 早已改过的 ldrh 口径统一。
-constexpr bool rules_is_ldrb_imm(u32 inst) { return (inst & 0xFFC00000u) == 0x39400000u; }
-constexpr PatchData rules_ldrb_imm_to_ldrh(u32 inst) { return PatchData{inst | 0x40000000u}; }
-
-constexpr bool rules_is_ldrb_reg(u32 inst) { return (inst & 0xFFE00C00u) == 0x38600800u; }
-constexpr PatchData rules_ldrb_reg_to_ldrh(u32 inst) { return PatchData{inst | 0x40000000u}; }
-
-// 另一版本族把该 ldrb 写成了非缩放的 imm9 形式：ldrb wT,[xN,#imm] -> ldurh
-constexpr PatchData rules_ldrb_imm_to_ldurh(u32 inst)
-{
-    const u32 imm = rules_bit(inst, 21, 10);
-    const u32 rn = rules_bit(inst, 9, 5);
-    const u32 rt = rules_bit(inst, 4, 0);
-    return PatchData{0x78400000u | (imm << 12) | (rn << 5) | rt};
-}
-
-// FAT_GetNextChar 里把刚读到的两个字节存回栈：strb -> sturh（同址同寄存器，只改宽度）
-constexpr bool rules_is_strb_imm_sp(u32 inst)
-{
-    return (inst & 0xFFC00000u) == 0x39000000u && rules_bit(inst, 9, 5) == REG_SP;
-}
-constexpr PatchData rules_strb_sp_to_sturh(u32 inst)
-{
-    const u32 imm = rules_bit(inst, 21, 10);
-    const u32 rt = rules_bit(inst, 4, 0);
-    return PatchData{0x78000000u | (imm << 12) | (REG_SP << 5) | rt};   // sturh wT,[sp,#imm]
-}
-
-// 比较值构造 orr wD,wN,wD,lsl #8 -> lsl #16，
-// 把第 3 个字节放进高字节（配合下面去掉掩码/扩展，得到 24 位单射比较值）。
-constexpr bool rules_is_orr_lsl8(u32 inst)
-{
-    return rules_bit(inst, 31, 31) == 0 && rules_bit(inst, 30, 29) == 0b01 &&
-           rules_bit(inst, 28, 24) == 0b01010 && rules_bit(inst, 23, 22) == 0 &&
-           rules_bit(inst, 21, 21) == 0 && rules_bit(inst, 15, 10) == NAME_BYTE1_SHIFT;
-}
-constexpr PatchData rules_orr_lsl8_to_16(u32 inst)
-{
-    return PatchData{rules_setbits(inst, 15, 10, NAME_BYTE2_SHIFT)};
-}
-
-// 16.1.0 把同一处写成了 BFI wD,wN,#8,#8；改为 #16,#8，语义与 orr lsl #16 相同。
-constexpr bool rules_is_bfi_8_8(u32 inst)
-{
-    return rules_bit(inst, 31, 31) == 0 && rules_bit(inst, 30, 29) == 0b01 &&
-           rules_bit(inst, 28, 23) == 0b100110 &&
-           rules_bit(inst, 21, 16) == BFM_IMMR_LSB8 && rules_bit(inst, 15, 10) == BFM_IMMS_W8;
-}
-constexpr PatchData rules_bfi_8_8_to_16_8(u32 inst)
-{
-    return PatchData{rules_setbits(inst, 21, 16, BFM_IMMR_LSB16)};
-}
-
-// StringDesc 消费点：原版 `csel/cinc Rd,Rn,...`（条件选择，用于跳过 1/2 个字节）
+// FsString 消费点（AddLeft / GetCharCount / CompareUnicode / CompareOem）：
+// 原版 `csel/cinc Rd,Rn,...`（条件选择，用于跳过 1 或 2 个字节）
 // 改成无条件 `add Rd,Rn,w0`（推进 w0 个字节）。宽/窄（sf）保留。
 constexpr bool rules_is_csel_cinc(u32 inst)
 {
@@ -794,31 +692,6 @@ constexpr PatchData rules_csel_cinc_to_add(u32 inst)
     const u32 rn = rules_bit(inst, 9, 5);
     const u32 rd = rules_bit(inst, 4, 0);
     return PatchData{(sf << 31) | 0x0B000000u | (rn << 5) | rd};
-}
-
-// and wD,wN,#0xffff -> mov wD,wN（去掉 16 位掩码，保留第 3 个字节）
-constexpr bool rules_is_and_ffff(u32 inst)
-{
-    return rules_bit(inst, 31, 31) == 0 && rules_bit(inst, 30, 29) == 0b00 &&
-           rules_bit(inst, 28, 23) == 0b100100 && rules_bit(inst, 22, 22) == 0 &&
-           rules_bit(inst, 21, 16) == 0 && rules_bit(inst, 15, 10) == 15;
-}
-constexpr PatchData rules_and_ffff_to_mov(u32 inst)
-{
-    const u32 rn = rules_bit(inst, 9, 5);
-    const u32 rd = rules_bit(inst, 4, 0);
-    return PatchData{0x2A0003E0u | (rn << 16) | rd};   // mov wD,wN = orr wD,wzr,wN
-}
-
-// cmp wD,wN,uxth -> cmp wD,wN（32 位下 UXTH 扩展是空操作，去掉后
-// 比较的就是完整 24 位值；扩展寄存器形式要切回移位寄存器形式）
-constexpr bool rules_is_cmp_uxth(u32 inst)
-{
-    return (inst & 0xFF20001Fu) == 0x6B20001Fu && rules_bit(inst, 15, 13) == 0b001;
-}
-constexpr PatchData rules_cmp_uxth_to_cmp(u32 inst)
-{
-    return PatchData{rules_setbits(inst, 15, 10, 0) & ~(1u << 21)};
 }
 
 // FAT_MakeShortName 把 OEMCharWidth 的返回值当字符宽度走 2 字节拷贝循环，
@@ -844,13 +717,14 @@ constexpr PatchData rules_movz_2e_to_movz2(u32 inst)
 // 补丁表
 //
 // 一级：fs_fn_groups[]  —— 按「被改写的 fs 函数」分组，只管组织与日志进度。
-// 二级：fs_inst_patches[]（指令改写）/ fs_blob_patches[]（整函数替换），两组各自
-//       连续排布，组用下标切子区间。
+// 二级：fs_inst_patches[]（指令改写）/ fs_blob_patches[]（整函数替换），
+//       两组各自连续排布，组用下标切子区间。
 //
-// ⚠️ 行内格式由构建期守卫按正则从**源码文本**解析，改格式必须同步
-//    tools/check_patch_sizes.py（以及 dev/fs-codepage 分支上的 fs_fw_audit.py）：
-//   patch_name    log.ini 键名；格式 `<功能名>_<版本范围>`，族号 = 版本范围之前的
-//                 功能前缀（fs_family_of）。范围 = 语料实测覆盖，精确到 x.y.z：
+// ⚠️ 行内格式由构建期守卫按正则从**源码文本**解析，
+//    改格式必须同步 scripts/check_patch_sizes.py 与 scripts/fs_fw_audit.py：
+//   patch_name    log.ini 键名；格式 `<功能名>_<版本范围>`，
+//                 族号 = 版本范围之前的功能前缀（fs_family_of）。
+//                 范围 = 语料实测覆盖，精确到 x.y.z：
 //                 `12.0.0-15.0.1` / `16.0.0+`；非连续覆盖用 `,` 分段。
 //   byte_pattern  定位模板；"0x" 之后一个 ".." = 一个通配字节
 //   inst_offset   落点指令 = 命中处 + inst_offset（字长的倍数）
@@ -862,7 +736,8 @@ constexpr PatchData rules_movz_2e_to_movz2(u32 inst)
 
 // §3 表结构 · 谓词清单 + 条目类型 ───────────────────────────────────────────────
 // ── 谓词清单（唯一定义处：位号 = 列出次序）──────────────────────────────────
-// 展开成两处：fs_preds[]（cond → 位号的反查表，条目表因此不需要 pred_idx 列）与
+// 展开成两处：
+// fs_preds[]（cond → 位号的反查表，条目表因此不需要 pred_idx 列）；
 // fs_pred_mask()（每字一次的直调序列；位号是常量，全部折叠成立即数）。
 #define FS_PRED_LIST(X)       \
     X(rules_is_bcond)         /* b.<cc> 条件分支 → nop */          \
@@ -878,8 +753,8 @@ constexpr bool (*const fs_preds[])(u32 inst) = {
 };
 constexpr u32 FS_PRED_COUNT = std::size(fs_preds);
 
-// cond → 位号。返回 FS_PRED_COUNT 表示「不在清单里」：位图永不置它的位，该条目
-// 永远命中不了（fs_pat_live 会拦住它，构建期守卫也会报错）。
+// cond → 位号。返回 FS_PRED_COUNT 表示「不在清单里」：
+// 位图永不置它的位，该条目永远命中不了（fs_pat_live 会拦住它，构建期守卫也会报错）。
 constexpr u32 fs_pred_index(bool (*cond)(u32 inst))
 {
     for (u32 k = 0; k < FS_PRED_COUNT; k++) {
@@ -888,8 +763,9 @@ constexpr u32 fs_pred_index(bool (*cond)(u32 inst))
     return FS_PRED_COUNT;
 }
 
-// 每字一掩码：bit k = 谓词 k 在该字上成立。nmask（本块需要算哪些谓词）在一整块内
-// 恒定 ⇒ 分支可预测；谓词本体是 constexpr 位掩码测试，会被内联。
+// 每字一掩码：bit k = 谓词 k 在该字上成立。
+// nmask（本块需要算哪些谓词）在一整块内恒定 ⇒ 分支可预测；
+// 谓词本体是 constexpr 位掩码测试，会被内联。
 inline u32 fs_pred_mask(u32 inst, u32 nmask)
 {
     u32 m = 0;
@@ -903,18 +779,19 @@ inline u32 fs_pred_mask(u32 inst, u32 nmask)
 }
 
 // ── 整函数替换条目（换掉整个函数体）────────────────────────────────────────
-// 这些点无法用「改一条指令」表达（转换器、isOEMMBchar、有界 Unicode2OEM、ASCII-only
-// ToUpper、通配符匹配、FAT_GetNextChar），pattern 只负责定位。替换体签名各不相同，
+// 这些点无法用「改一条指令」表达
+// （转换器、isOEMMBchar、有界 Unicode2OEM、ASCII-only ToUpper、通配符匹配、FAT_GetNextChar），
+// pattern 只负责定位。替换体签名各不相同，
 // 表里存种类、运行期 fs_blob_range() switch 取址（放函数地址不是常量表达式）。
 
 enum class FsBlobImpl : u8 {
-    Utf16ToUtf8,     // patch_utf16_to_utf8
-    Utf8ToUtf16,     // patch_utf8_to_utf16
+    Utf16ToOem,     // patch_utf16_to_utf8
+    OemToUtf16,     // patch_utf8_to_utf16
     IsOemMbChar,     // patch_is_oem_mb_char
     WideCharCompare, // patch_widechar_compare
     FatGetNextChar,  // patch_fat_getnextchar
-    StrUnicode2Oem,  // patch_str_unicode2oem
-    StrDescToUpper,  // patch_stringdesc_toupper
+    StrUtf16ToOem,  // patch_str_utf16_to_utf8
+    FsStringToUpper,  // patch_fsstring_toupper
 };
 
 struct FsBlobPatch {
@@ -956,11 +833,11 @@ struct FsInstPatch {
     PatchResult result{PatchResult::NOT_FOUND};
 };
 
-// §4 补丁表 · ⚠️ 任何改动都必须通过构建期守卫 tools/check_patch_sizes.py
+// §4 补丁表 · 任何改动都必须通过构建期守卫 scripts/check_patch_sizes.py
 //    （结构不变量 + 唯一命中 + 落点指令满足 cond + 收割可行性）。
 //
-// 一级表：12 个函数组。四列 = 本组在 fs_inst_patches[] / fs_blob_patches[] 里的
-// 下标区间（左闭右开）。注释里的地址 = 参考二进制 19.0.1/exfat 的实测函数入口，
+// 一级表：按被改写的 fs 函数分组。四列 = 本组在 fs_inst_patches[] / fs_blob_patches[] 里的下标区间
+// （左闭右开）。注释里的地址 = 参考二进制 19.0.1/exfat 的实测函数入口，
 // 由构建期守卫核对；进度日志打的也是 label。
 constinit FsFnGroup fs_fn_groups[] = {
     { "IDirectory_Read          ",  0,  3,  0,  0 }, // 0xD4AF4   3 指令
@@ -968,103 +845,104 @@ constinit FsFnGroup fs_fn_groups[] = {
     { "WideChar_Compare         ",  3,  3,  3,  8 }, // 0xF4770   5 替换
     { "FAT_GetNextPathComponent ",  3,  5,  8,  8 }, // 0xF4BBC   2 指令
     { "FAT_MakeShortName        ",  5,  7,  8,  8 }, // 0xF5AC0   2 指令
-    { "StringDesc_AddLeft       ",  7,  9,  8,  8 }, // 0xF7788   2 指令
-    { "StringDesc_GetCharCount  ",  9, 11,  8,  8 }, // 0xF7924   2 指令
-    { "StringDesc_CompareUnicode", 11, 14,  8,  8 }, // 0xF79F4   3 指令
-    { "StringDesc_CompareOem    ", 14, 18,  8,  8 }, // 0xF7B14   4 指令
-    { "PFCODE_Converters        ", 18, 18,  8, 15 }, // -         7 替换
-    { "PFCODE_Str_Unicode2OEM   ", 18, 18, 15, 19 }, // 0xF5840   4 替换
-    { "StringDesc_ToUpper       ", 18, 18, 19, 22 }, // 0xF7C10   3 替换
+    { "FsString_AddLeft         ",  7,  9,  8,  8 }, // 0xF7788   2 指令
+    { "FsString_GetCharCount    ",  9, 11,  8,  8 }, // 0xF7924   2 指令
+    { "FsString_CompareUnicode  ", 11, 14,  8,  8 }, // 0xF79F4   3 指令
+    { "FsString_CompareOem      ", 14, 18,  8,  8 }, // 0xF7B14   4 指令
+    { "CodePageConverters       ", 18, 18,  8, 15 }, // -         7 替换（ctx 回调组）
+    { "StrUnicode2OEM           ", 18, 18, 15, 19 }, // 0xF5840   4 替换
+    { "FsString_ToUpper         ", 18, 18, 19, 22 }, // 0xF7C10   3 替换
 };
 
-// 18 条指令改写条目（顺序 = 上面各组的指令区间）。
-// 名字 = `<功能名>_<版本范围>`。同一功能名的多条模板 = **跨版本互斥的变体族**
-// （见「族」机制：族号就是从名字里剥掉版本范围后的功能前缀）。
+// 补丁条目（顺序 = 上面各组的指令区间）。
+// 名字 = `fs_cp_<前缀><方向/动作>_<版本范围>`，全小写（守卫 NAME_RE 只收小写）：
+//   功能前缀里不得出现「_ + 数字」：族边界 = 第一个「_数字」（fs_family_of/守卫 point_of 同口径）。
+// 同一功能名的多条模板 = **跨版本互斥的变体族**（族号 = 名字剥掉版本范围后的前缀）。
 //
-// ⚠️ 版本范围 = **语料实测**（`scripts/fs_version_matrix.py`，逐小版本 × 逐条目数命中），
+// 版本范围 = **语料实测**（`scripts/fs_version_matrix.py`，逐小版本 × 逐条目数命中），
 // 写成精确 x.y.z 粒度：`12.0.0-15.0.1` / `16.0.0+` / `12.0.0-14.1.2,21.0.0+`。
-// 依据（2026-09-30 全语料 45 版实测）：fs 驱动**在大版本内也会变**（12.0.x→12.1.0、
-// 13.0.0→13.1.0、16.0.2→16.0.3、18.0.x→18.1.0、21.1.0→21.2.0、22.1.0→22.5.0 各有
-// 新代），major 粒度命名是外推、会失真 ⇒ 必须按实测端点写；区间内未入库的小版本
 // 由「模式命中 + 谓词校验 + 收割失败整组放弃」兜底。改名后必跑 fs_version_matrix。
 constinit FsInstPatch fs_inst_patches[] = {
     // IDirectory_Read：名字字符校验分支 b.<cc> → nop（否则非英文名一律被拒）
-    { "fs_cp_idirectory_read_16.0.0+",            "0x..FD0151....0131......54", 8, rules_is_bcond, rules_nop },
-    { "fs_cp_idirectory_read_12.0.0-15.0.1",          "0x..FDFF54..890051........", 0, rules_is_bcond, rules_nop },
-    { "fs_cp_idirectory_read_10.0.0-11.0.1",      "0x........2A8900515FE90071A8000054........6A21CA9A5F0116EA", 0, rules_is_bcond, rules_nop },
+    { "fs_cp_idirectory_read_10.0.0-11.0.1",           "0x........2A8900515FE90071A8000054........6A21CA9A5F0116EA",    0, rules_is_bcond, rules_nop },
+    { "fs_cp_idirectory_read_12.0.0-15.0.1",           "0x..FDFF54..890051",                                            0, rules_is_bcond, rules_nop },
+    { "fs_cp_idirectory_read_16.0.0+",                 "0x..FD0151....0131......54",                                    8, rules_is_bcond, rules_nop },
     // FAT_GetNextPathComponent：步进 add Rd,Rn,#1 → add Rd,Rn,w0（按 UTF-8 字符长前进）
     //   12-14 那条尾部多带一拍 `ldr x9,[x28,#0x30]`（ctx+0x30 = isOEMMBchar）作锚：
     //   12 字节的短模板会撞进一个同形的字符串追加函数。
-    { "fs_cp_fat_getnextpathcomp_step_15.0.0+",   "0x..00805209050091690600F9", 4, rules_is_add_imm, rules_add_imm_to_add0 },
-    { "fs_cp_fat_getnextpathcomp_step_10.0.0-14.1.2", "0x680640F909050091690600F9891B40F9", 4, rules_is_add_imm, rules_add_imm_to_add0 },
-    // FAT_MakeShortName：宽度钳制 → movz wD,#2
-    //   （原版按 OEMCharWidth 走 2 字节拷贝循环，UTF-8 的 3 字节字符会让 subs 永不归零）
-    //   同一功能的两种源指令形态：15–20 是 `mov wD,w0`；10–14 与 21+ 是
-    //   `movz wD,#0x2e`（故后者的版本范围分两段）。
-    { "fs_cp_makeshortname_15.0.0-20.5.0",            "0xE80740B9F703002A1F21..6B", 4, rules_is_mov_w0, rules_mov_reg_to_movz2 },
-    { "fs_cp_makeshortname_10.0.0-14.1.2,21.0.0+",        "0xF703002ACD0580521F21..6B", 4, rules_is_movz_2e, rules_movz_2e_to_movz2 },
-    // StringDesc 消费点（AddLeft / GetCharCount / CompareUnicode / CompareOem）：
+    { "fs_cp_fat_getnextpathcomp_step_10.0.0-14.1.2",  "0x680640F909050091690600F9891B40F9",    4, rules_is_add_imm, rules_add_imm_to_add0 },
+    { "fs_cp_fat_getnextpathcomp_step_15.0.0+",        "0x..00805209050091690600F9",            4, rules_is_add_imm, rules_add_imm_to_add0 },
+    // FAT_MakeShortName：宽度钳制 → movz wD,#2（原版按 OEMCharWidth 走 2 字节拷贝循环，UTF-8 的 3 字节字符会让 subs 永不归零）
+    //   同一功能的两种源指令形态：15–20 是 `mov wD,w0`；10–14 与 21+ 是 `movz wD,#0x2e`（故后者的版本范围分两段）。
+    { "fs_cp_fat_makeshortname_10.0.0-14.1.2,21.0.0+", "0xF703002ACD0580521F21..6B",    4, rules_is_movz_2e, rules_movz_2e_to_movz2 },
+    { "fs_cp_fat_makeshortname_15.0.0-20.5.0",         "0xE80740B9F703002A1F21..6B",    4, rules_is_mov_w0, rules_mov_reg_to_movz2 },
+    // FsString 消费点（AddLeft / GetCharCount / CompareUnicode / CompareOem）：
     //   csel/cinc（跳 1 或 2 字节）→ 无条件 add Rd,Rn,w0
-    { "fs_cp_str_addleft_15.0.0+",                "0x94060051C806961A9F3E0072", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_addleft_10.0.0-14.1.2",              "0xC806961A940600519F3E007216050011", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_getcharcount_16.0.0+",           "0x940600117306939A601E4038", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_getcharcount_10.0.0-15.0.1",         "0x..06..9A........60..40....FFFF35..........................", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareunicode_16.0.0+",         "0xA11300D16802969A13050091", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareunicode_12.0.0-15.0.1",       "0x....969A........A80E40F9..............................78............0034..01....", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareunicode_10.0.0-11.0.1",   "0x6802969A13050091A80E40F9E1330091", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareoem_16.0.0-18.1.0",           "0x1F000071........89....9A", 8, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareoem_19.0.0+",             "0x1F0000719402979A..264078", 4, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareoem_12.0.0-15.0.1",           "0x..06..9A................................0001094B......A9........FD7B......03....", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
-    { "fs_cp_str_compareoem_10.0.0-11.0.1",       "0x8906949AB50A009134050091A8FDFF35E9031F2A0001094BFD7B43A9", 0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_fsstring_addleft_10.0.0-14.1.2",          "0xC806961A940600519F3E007216050011",    0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_fsstring_addleft_15.0.0+",                "0x94060051C806961A9F3E0072",            4, rules_is_csel_cinc, rules_csel_cinc_to_add },
+
+    { "fs_cp_fsstring_getcharcount_10.0.0-15.0.1",     "0x..06..9A........60..40....FFFF35",    0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_fsstring_getcharcount_16.0.0+",           "0x940600117306939A601E4038",            4, rules_is_csel_cinc, rules_csel_cinc_to_add },
+
+    { "fs_cp_fsstring_compareunicode_10.0.0-11.0.1",   "0x6802969A13050091A80E40F9E1330091",                                                0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_fsstring_compareunicode_12.0.0-15.0.1",   "0x....969A........A80E40F9..............................78............0034..01",    0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_fsstring_compareunicode_16.0.0+",         "0xA11300D16802969A13050091",                                                        4, rules_is_csel_cinc, rules_csel_cinc_to_add },
+
+    { "fs_cp_fsstring_compareoem_10.0.0-11.0.1",       "0x8906949AB50A009134050091A8FDFF35E9031F2A0001094BFD7B43A9",                        0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_fsstring_compareoem_12.0.0-15.0.1",       "0x..06..9A................................0001094B......A9........FD7B......03",    0, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_fsstring_compareoem_16.0.0-18.1.0",       "0x1F000071........89....9A",                                                        8, rules_is_csel_cinc, rules_csel_cinc_to_add },
+    { "fs_cp_fsstring_compareoem_19.0.0+",             "0x1F0000719402979A..264078",                                                        4, rules_is_csel_cinc, rules_csel_cinc_to_add },
 };
 
-// 22 条整函数替换条目：pattern 只负责定位，写入的是自包含、位置无关的替换实现。
+// 整函数替换条目：pattern 只负责定位，写入的是自包含、位置无关的替换实现。
 // 名字规则同 fs_inst_patches（功能名 + 版本范围）。
 constinit FsBlobPatch fs_blob_patches[] = {
     // FAT_GetNextChar → patch_fat_getnextchar（折叠该函数里全部 4 个指令点）
-    { "fs_cp_fat_getnextchar_16.0.0+",               "0xFF0301D1FD7B01A9F65702A9F44F03A9FD430091091040B9",          0, FsBlobImpl::FatGetNextChar },
-    { "fs_cp_fat_getnextchar_12.0.0-15.0.1",             "0xFF0301D1FD7B01A9FD430091F65702A9F44F03A9..1040B9F303012A",    0, FsBlobImpl::FatGetNextChar },
-    { "fs_cp_fat_getnextchar_10.0.0-11.0.1",         "0xFF0301D1F65701A9F44F02A9FD7B03A9FDC30091091040B9",          0, FsBlobImpl::FatGetNextChar },
+    { "fs_cp_fat_getnextchar_10.0.0-11.0.1",    "0xFF0301D1F65701A9F44F02A9FD7B03A9FDC30091091040B9",           0, FsBlobImpl::FatGetNextChar },
+    { "fs_cp_fat_getnextchar_12.0.0-15.0.1",    "0xFF0301D1FD7B01A9FD430091F65702A9F44F03A9..1040B9F303012A",   0, FsBlobImpl::FatGetNextChar },
+    { "fs_cp_fat_getnextchar_16.0.0+",          "0xFF0301D1FD7B01A9F65702A9F44F03A9FD430091091040B9",           0, FsBlobImpl::FatGetNextChar },
     // WideChar_Compare → patch_widechar_compare（折叠该函数里全部 15 个指令点）
-    //   12-14 那条把尾部 adrp 的 4 字节整拍放宽（老固件 ctx 槽地址不同）并补
-    //   `F30303AAF40301AA` 作锚 —— 只放宽不补锚会有 7~8 个命中点。
-    { "fs_cp_widechar_compare_17.0.0+",              "0xFF4302D1FD7B03A9FB2300F9FA6705A9F85F06A9F65707A9F44F08A9FDC30091........F30303AA", 0, FsBlobImpl::WideCharCompare },
-    { "fs_cp_widechar_compare_16.0.0-16.1.0",               "0xFF0302D1FD7B03A9FA6704A9F85F05A9F65706A9F44F07A9FDC30091........F30303AA",     0, FsBlobImpl::WideCharCompare },
-    { "fs_cp_widechar_compare_12.0.0-14.1.2",            "0xFF4302D1FD7B03A9FDC30091FB2300F9FA6705A9F85F06A9F65707A9F44F08A9................F30303AAF40301AA", 0, FsBlobImpl::WideCharCompare },
-    { "fs_cp_widechar_compare_15.0.0-15.0.1",               "0xFF4302D1FD7B03A9FDC30091FB2300F9FA6705A9F85F06A9F65707A9F44F08A9....00..F30303AA", 0, FsBlobImpl::WideCharCompare },
-    { "fs_cp_widechar_compare_10.0.0-11.0.1",        "0xFF4302D1FB1B00F9FA6704A9F85F05A9F65706A9F44F07A9FD7B08A9FD030291................F30303AAF40301AA", 0, FsBlobImpl::WideCharCompare },
-    // PFCODE 三个编码原语（ctx 回调表指向的函数）→ UTF-8 实现
+    //   12-14 那条把尾部 adrp 的 4 字节整拍放宽（老固件 ctx 槽地址不同）
+    //   并补 `F30303AAF40301AA` 作锚 —— 只放宽不补锚会有 7~8 个命中点。
+    { "fs_cp_widechar_compare_10.0.0-11.0.1",   "0xFF4302D1FB1B00F9FA6704A9F85F05A9F65706A9F44F07A9FD7B08A9FD030291................F30303AAF40301AA",   0, FsBlobImpl::WideCharCompare },
+    { "fs_cp_widechar_compare_12.0.0-14.1.2",   "0xFF4302D1FD7B03A9FDC30091FB2300F9FA6705A9F85F06A9F65707A9F44F08A9................F30303AAF40301AA",   0, FsBlobImpl::WideCharCompare },
+    { "fs_cp_widechar_compare_15.0.0-15.0.1",   "0xFF4302D1FD7B03A9FDC30091FB2300F9FA6705A9F85F06A9F65707A9F44F08A9....00..F30303AA",                   0, FsBlobImpl::WideCharCompare },
+    { "fs_cp_widechar_compare_16.0.0-16.1.0",   "0xFF0302D1FD7B03A9FA6704A9F85F05A9F65706A9F44F07A9FDC30091........F30303AA",                           0, FsBlobImpl::WideCharCompare },
+    { "fs_cp_widechar_compare_17.0.0+",         "0xFF4302D1FD7B03A9FB2300F9FA6705A9F85F06A9F65707A9F44F08A9FDC30091........F30303AA",                   0, FsBlobImpl::WideCharCompare },
+    // ctx 回调表三个编码原语（原 PFCODE_* 位点）→ UTF-8 实现
     //   OEM2Unicode 在 12.x 上是另一代代码生成（tbz 在下、无 strh/mov 三连），
     //   而 16.x+ 那条松散模板会**意外**命中它（落点对但名字说谎）⇒ 单独开一条，
     //   并把 16+ 那条补上 `mov w0,#1` 收紧。
-    { "fs_cp_pfcode_unicode2oem_10.0.0+",            "0x00000000..004079..FD0171",                              4, FsBlobImpl::Utf16ToUtf8 },
-    { "fs_cp_pfcode_oem2unicode_10.0.0-12.1.0",             "0x0800C0390A1D0012EB030A2A2803F836",                      0, FsBlobImpl::Utf8ToUtf16 },
-    { "fs_cp_pfcode_oem2unicode_13.0.0-15.0.1",          "0x0A00C039..1D0012..03..2A0A03F836..7D0111",                0, FsBlobImpl::Utf8ToUtf16 },
-    { "fs_cp_pfcode_oem2unicode_16.0.0+",            "0x........0800C039..1D0012........20008052",                4, FsBlobImpl::Utf8ToUtf16 },
-    { "fs_cp_pfcode_is_oem_mb_char_12.0.0-15.0.1",       "0x0A000151....00....1C00......00......00..EA279F1A3F010071",      0, FsBlobImpl::IsOemMbChar },
-    { "fs_cp_pfcode_is_oem_mb_char_16.0.0+",         "0x08..........................00....078052......7A",                      0, FsBlobImpl::IsOemMbChar },
-    { "fs_cp_pfcode_is_oem_mb_char_10.0.0-11.0.1",   "0x0A1C00135F0100710B1C001208000151",                                      0, FsBlobImpl::IsOemMbChar },
-    // PFCODE_Str_Unicode2OEM → patch_str_unicode2oem（有界转换；21.x/22.x 入口在命中点后 4 字节）
-    { "fs_cp_str_unicode2oem_16.0.0-20.5.0",             "0x3F482838C0035FD600000000FF4301D1",                   12, FsBlobImpl::StrUnicode2Oem },
-    { "fs_cp_str_unicode2oem_21.0.0+",               "0x3F482838C0035FD60000000000000000FF0301D1",           16, FsBlobImpl::StrUnicode2Oem },
-    { "fs_cp_str_unicode2oem_12.0.0-15.0.1",             "0xFF4301D1FD7B01A9FD430091F71300F9F65703A9F44F04A9BF3B0079", 0, FsBlobImpl::StrUnicode2Oem },
-    { "fs_cp_str_unicode2oem_10.0.0-11.0.1",         "0xFF4301D1FFDF00A9F65702A9F44F03A9FD7B04A9FD030191FF3B0079........", 0, FsBlobImpl::StrUnicode2Oem },
-    // StringDesc_ToUpper → patch_stringdesc_toupper（OEM 分支改 ASCII-only）
+    { "fs_cp_utf16_to_oem_10.0.0+",             "0x00000000..004079..FD0171",   4, FsBlobImpl::Utf16ToOem },
+    { "fs_cp_oem_to_utf16_10.0.0-12.1.0",       "0x0800C0390A1D0012EB030A2A2803F836",           0, FsBlobImpl::OemToUtf16 },
+    { "fs_cp_oem_to_utf16_13.0.0-15.0.1",       "0x0A00C039..1D0012..03..2A0A03F836..7D0111",   0, FsBlobImpl::OemToUtf16 },
+    { "fs_cp_oem_to_utf16_16.0.0+",             "0x........0800C039..1D0012........20008052",   4, FsBlobImpl::OemToUtf16 },
+    { "fs_cp_is_oem_mb_char_10.0.0-11.0.1",     "0x0A1C00135F0100710B1C001208000151",                           0, FsBlobImpl::IsOemMbChar },
+    { "fs_cp_is_oem_mb_char_12.0.0-15.0.1",     "0x0A000151....00....1C00......00......00..EA279F1A3F010071",   0, FsBlobImpl::IsOemMbChar },
+    { "fs_cp_is_oem_mb_char_16.0.0+",           "0x08..........................00....078052......7A",           0, FsBlobImpl::IsOemMbChar },
+    // StrUnicode2OEM（fs 原生有界 Unicode→OEM）→ patch_str_utf16_to_utf8（21.x/22.x 入口在命中点后 4 字节）
+    { "fs_cp_str_utf16_to_oem_10.0.0-11.0.1",   "0xFF4301D1FFDF00A9F65702A9F44F03A9FD7B04A9FD030191FF3B0079",   0, FsBlobImpl::StrUtf16ToOem },
+    { "fs_cp_str_utf16_to_oem_12.0.0-15.0.1",   "0xFF4301D1FD7B01A9FD430091F71300F9F65703A9F44F04A9BF3B0079",   0, FsBlobImpl::StrUtf16ToOem },
+    { "fs_cp_str_utf16_to_oem_16.0.0-20.5.0",   "0x3F482838C0035FD600000000FF4301D1",                           12, FsBlobImpl::StrUtf16ToOem },
+    { "fs_cp_str_utf16_to_oem_21.0.0+",         "0x3F482838C0035FD60000000000000000FF0301D1",                           16, FsBlobImpl::StrUtf16ToOem },
+    // FsString_ToUpper → patch_fsstring_toupper（OEM 分支改 ASCII-only）
     //   10/11 的序言多一拍 `str x21,[sp,#-0x30]!`，12+ 没有 ⇒ 单独一条。
-    { "fs_cp_stringdesc_toupper_16.0.0+",            "0xFD7BBDA9F50B00F9F44F02A9FD030091081040B9",           0, FsBlobImpl::StrDescToUpper },
-    { "fs_cp_stringdesc_toupper_12.0.0-15.0.1",          "0xFD7BBDA9F50B00F9FD030091F44F02A9081040B9",           0, FsBlobImpl::StrDescToUpper },
-    { "fs_cp_stringdesc_toupper_10.0.0-11.0.1",      "0xF50F1DF8F44F01A9FD7B02A9FD830091081040B9........",   0, FsBlobImpl::StrDescToUpper },
+    { "fs_cp_fsstring_toupper_10.0.0-11.0.1",   "0xF50F1DF8F44F01A9FD7B02A9FD830091081040B9",   0, FsBlobImpl::FsStringToUpper },
+    { "fs_cp_fsstring_toupper_12.0.0-15.0.1",   "0xFD7BBDA9F50B00F9FD030091F44F02A9081040B9",   0, FsBlobImpl::FsStringToUpper },
+    { "fs_cp_fsstring_toupper_16.0.0+",         "0xFD7BBDA9F50B00F9F44F02A9FD030091081040B9",   0, FsBlobImpl::FsStringToUpper },
 };
 
-static_assert(std::size(fs_inst_patches) == 18);
-static_assert(std::size(fs_blob_patches) == 22);
-static_assert(std::size(fs_fn_groups) == 12);
+// 不写死表长（加条目就得改三处，是漂移源）；只守真正的不变式：
+// 下标是 u8/u16 能装下的量级，以及位图挤得进一个 u32。
+static_assert(std::size(fs_inst_patches) <= 0xFFFFu);
+static_assert(std::size(fs_blob_patches) <= 0xFFFFu);
+static_assert(std::size(fs_fn_groups) <= 0xFFu);
 static_assert(FS_PRED_COUNT <= 32);   // 位图挤在一个 u32 里
 
 /* 命中站点记录（仅诊断）：fs 的补丁扫描命中后把补丁位的**绝对地址**记下来，
  * 由调用方换算成「相对模块基址的偏移」写进 log.ini。只存内存不落盘 ——
  * 附加调试后 fs 是挂起的，此时任何写 SD 的操作都会永久阻塞。 */
-constexpr u32 FS_SITE_MAX = 64;   // ≥ 40 条条目（18 指令 + 22 替换），留余量
+constexpr u32 FS_SITE_MAX = 64;   // 见下方 static_assert：自动保证够用
 
 struct FsSiteSink {
     struct Rec { const char* name; u64 addr; };
@@ -1082,17 +960,20 @@ struct FsSiteSink {
 
 static FsSiteSink fs_sites;
 
-// 被扫描代码段（fs 主 .text）的基址：命中站点记的是绝对地址，落盘前换算成
-// 「相对模块基址的偏移」，与 RESOLVED.md / Ghidra 的 VA 同口径。
+// 站点记录要能装下两张条目表的全部命中（每点每变体各一条）。
+static_assert(FS_SITE_MAX >= std::size(fs_inst_patches) + std::size(fs_blob_patches));
+
+// 被扫描代码段（fs 主 .text）的基址：命中站点记的是绝对地址，
+// 落盘前换算成「相对模块基址的偏移」，与 Ghidra 的 VA 同口径。
 static u64 fs_code_base = 0;
 
 static auto fs_blob_range(FsBlobImpl impl) -> FsBlobRange
 {
     switch (impl) {
-        case FsBlobImpl::Utf8ToUtf16:
+        case FsBlobImpl::OemToUtf16:
             return { (const void*)patch_utf8_to_utf16,
                      (u32)patch_code_size(patch_utf8_to_utf16, patch_utf8_to_utf16_end) };
-        case FsBlobImpl::Utf16ToUtf8:
+        case FsBlobImpl::Utf16ToOem:
             return { (const void*)patch_utf16_to_utf8,
                      (u32)patch_code_size(patch_utf16_to_utf8, patch_utf16_to_utf8_end) };
         case FsBlobImpl::IsOemMbChar:
@@ -1104,30 +985,29 @@ static auto fs_blob_range(FsBlobImpl impl) -> FsBlobRange
         case FsBlobImpl::WideCharCompare:
             return { (const void*)patch_widechar_compare,
                      (u32)patch_code_size(patch_widechar_compare, patch_widechar_compare_end) };
-        case FsBlobImpl::StrUnicode2Oem:
-            return { (const void*)patch_str_unicode2oem,
-                     (u32)patch_code_size(patch_str_unicode2oem, patch_str_unicode2oem_end) };
-        case FsBlobImpl::StrDescToUpper:
-            return { (const void*)patch_stringdesc_toupper,
-                     (u32)patch_code_size(patch_stringdesc_toupper, patch_stringdesc_toupper_end) };
+        case FsBlobImpl::StrUtf16ToOem:
+            return { (const void*)patch_str_utf16_to_utf8,
+                     (u32)patch_code_size(patch_str_utf16_to_utf8, patch_str_utf16_to_utf8_end) };
+        case FsBlobImpl::FsStringToUpper:
+            return { (const void*)patch_fsstring_toupper,
+                     (u32)patch_code_size(patch_fsstring_toupper, patch_fsstring_toupper_end) };
     }
 
     std::unreachable();
 }
 
-// 位面的索引单位：AArch64 指令 = 4 字节（字），位图按 64 位一组。二者都要求块基址
-// 落在 fs 的字网格上，故 overlap 必须是字长的整数倍。
+// 位面的索引单位：AArch64 指令 = 4 字节（字），位图按 64 位一组。
+// 二者都要求块基址落在 fs 的字网格上，故 overlap 必须是字长的整数倍。
 constexpr u32 FS_WORD_BYTES = 4;
 constexpr u32 FS_WORD_BITS  = 64;
-constexpr u64 FS_OVERLAP    = 0x50;   // ≥ 最长模板 42 字节；奇数会让位面索引全部错位
-static_assert(FS_OVERLAP % FS_WORD_BYTES == 0,
-              "M3 的位面索引要求块基址对齐 fs 的 4 字节字网格");
+constexpr u64 FS_OVERLAP    = 0x50;   // ≥ 最长模板（长度由守卫实测报出）；奇数会让位面索引全部错位
+static_assert(FS_OVERLAP % FS_WORD_BYTES == 0, "位面索引要求块基址对齐 fs 的 4 字节字网格");
 
 // §5 扫描器 · 谓词位图（按谓词分层的 bit-plane）──────────────────────────────
-// 每块先算一遍谓词位图：每个字算出命中哪些谓词，记进各谓词自己的位面。每条条目只
-// 遍历自己位面里置位的字，再做字节模板比对 —— 成本与补丁点数解耦。
-// 前提（守卫逐条校验）：pattern 的 inst_offset 是字长的倍数，且唯一命中位置与指令
-// 同字对齐；位面里的谓词就是条目的 cond 本身 ⇒ 预筛不会漏。
+// 每块先算一遍谓词位图：每个字算出命中哪些谓词，记进各谓词自己的位面。
+// 每条条目只遍历自己位面里置位的字，再做字节模板比对 —— 成本与补丁点数解耦。
+// 前提（守卫逐条校验）：pattern 的 inst_offset 是字长的倍数，
+// 且唯一命中位置与指令同字对齐；位面里的谓词就是条目的 cond 本身 ⇒ 预筛不会漏。
 constexpr u32 FS_SCAN_BYTES = READ_BUFFER_SIZE + FS_OVERLAP;     // 单块最大字节数（含 overlap）
 constexpr u32 FS_BIT_WORDS  = (FS_SCAN_BYTES / FS_WORD_BYTES + FS_WORD_BITS - 1) / FS_WORD_BITS;
 static u64 fs_pred_plane[FS_PRED_COUNT][FS_BIT_WORDS];
@@ -1149,13 +1029,16 @@ static void fs_build_pred_bits(const u8* data, size_t data_size, u32 nmask)
 }
 
 // ── 族（补丁点）与「兄弟姐妹提前退役」──────────────────────────────────────
-// 一个补丁点常带多条**跨版本互斥变体**：同一份固件上至多一条命中（26 份语料逐份校验
-// 过，构建期守卫再兜一次）。于是任一变体定位成功 ⇒ 同族其余变体在这份固件上永远命中
-// 不了，不必再为它们建位面、走位面、做字节比对 —— 这是启动成本的大头。
+// 一个补丁点常带多条**跨版本互斥变体**：同一份固件上至多一条命中
+// （全语料逐份校验过，构建期守卫再兜一次）。
+// 于是任一变体定位成功 ⇒ 同族其余变体在这份固件上永远命中不了，
+// 不必再为它们建位面、走位面、做字节比对 —— 这是启动成本的大头。
 //
-// 族 = 条目名里版本范围之前的功能前缀（名字规则 `<功能名>_<版本范围>`，见 §4）：同名 =
-// 同族，异名 = 异族。前缀边界 = 第一个「`_` + 数字」，与守卫 point_of() 同口径。
-// 登记表满则返回 FS_FAM_NONE ⇒ 该条目不参与退役判定，退化为「不跳兄弟」（仍正确，只是慢）。
+// 族 = 条目名里版本范围之前的功能前缀（名字规则 `<功能名>_<版本范围>`，见 §4）：
+// 同名 = 同族，异名 = 异族。
+// 前缀边界 = 第一个「`_` + 数字」，与守卫 point_of() 同口径。
+// 登记表满则返回 FS_FAM_NONE ⇒ 该条目不参与退役判定，
+// 退化为「不跳兄弟」（仍正确，只是慢）。
 constexpr u32 FS_FAM_NONE = 0xFFFFFFFFu;
 constexpr u32 FS_FAM_COUNT = 32;                 // 族号位图挤在一个 u32 里
 
@@ -1205,8 +1088,8 @@ static void fs_build_families(void)
 }
 
 /* 「已解决族」位掩码：任一成员**定位成功**（打过/已被别人打过/写失败/收割失败 ——
- * 都说明 pattern 在这份固件上找到了位置）即置位。每块重算一次，只在 31 条上走一遍，
- * 不引入跨调用状态。 */
+ * 都说明 pattern 在这份固件上找到了位置）即置位。
+ * 每块重算一次，只在条目表上走一遍，不引入跨调用状态。 */
 static u32 fs_fam_collect(void)
 {
     u32 m = 0;
@@ -1226,8 +1109,8 @@ static u32 fs_fam_collect(void)
 static u32 fs_fam_done = 0;                      // 当前块的「已解决族」快照
 
 /* 条目还需要扫描吗？**唯一判据**，建位面、组调度、两条扫描循环都走它。
- * fam_solved 由调用方传入：建位面/调度用每块快照 fs_fam_done；扫描循环用本块内
- * 就地退役的 fam_local（同族兄弟在本块刚落地 ⇒ 立刻停扫）。
+ * fam_solved 由调用方传入：建位面/调度用每块快照 fs_fam_done；
+ * 扫描循环用本块内就地退役的 fam_local（同族兄弟在本块刚落地 ⇒ 立刻停扫）。
  * pred_idx >= FS_PRED_COUNT 表示 cond 不在谓词清单里：位图永不为它置位 ⇒ 恒不命中。
  * 这里显式判掉（顺便挡住拿它当位面下标的越界），构建期守卫另有报错。
  * FAILED_* 的条目不再跨块重试：同一位置重试必然同样失败（结果由该点的字节决定）。 */
@@ -1322,7 +1205,7 @@ static void fs_inst_scan(Handle handle, const u8* data, size_t data_size, u64 ad
                 const auto patch_data = p.patch(inst);
                 const u64 site = addr + q * FS_WORD_BYTES;   // 落点指令地址 = 写入地址
 
-                // todo: log failed writes, although this should in theory never fail
+                // todo: 记录写失败（理论上不应发生）
                 if (R_FAILED(svcWriteDebugProcessMemory(handle, &patch_data, site, patch_data.size))) {
                     p.result = PatchResult::FAILED_WRITE;
                 } else {
@@ -1337,18 +1220,22 @@ static void fs_inst_scan(Handle handle, const u8* data, size_t data_size, u64 ad
     }
 }
 
-// §6 现场收割：把替换体里的哨兵占位改成真实地址 ══════════════════════════════
-// fs 的代码页上下文槽地址逐固件都不同（实测 18 个取值）—— 写死会在其它固件上解引用
-// 野指针。信息就在即将被覆写的原函数字节里（原版自己就用 adrp+ldr 取这个槽）：
-//   ① ctx 槽：在原件前 FS_CTX_SCAN 字节里找唯一一条 adrp 及其唯一配对的 ldr
-//      （Rn = Rt = adrp 的 Rd）→ 解出槽地址 → 重编码成 `adrp x3 + add x3,#lo12`
-//      覆写 ctx 哨兵对；替换体随后 `ldr x3,[x3]` 得到 ctx。
-//   ② callee：在原件前 FS_CALL_SCAN 字节里找「目标跳出函数体」的 bl，按**去重后的
-//      目标数 == 1** 判定（同一 callee 可被多条 bl 调用）→ 重编码成 `adrp x9 + add`
-//      覆写 callee 哨兵对；替换体用 `blr x9` 调用（整段覆写后 BL 的相对偏移不再有效）。
+// §6 现场收割：把替换体里的哨兵占位填成真实地址 ══════════════════════════════
+// fs 的代码页上下文槽地址逐固件都不同（实测 18 个取值）——
+// 写死会在其它固件上解引用野指针。
+// 信息就在即将被覆写的原函数字节里（原版自己就用 adrp+ldr 取这个槽）：
+//   ① ctx 槽：在原件前 FS_CTX_SCAN 字节里枚举所有 (adrp, 配对 ldr) 组合
+//      （配对 = ldr 的 Rn = Rt = adrp 的 Rd，且位置在 adrp 之后），
+//      只留解出的槽落在「函数体之后、距代码 ≤ FS_CTX_MAX_DELTA」的候选，
+//      去重后**恰好 1 个**才收 → 重编码成 `adrp x3 + add x3,#lo12` 覆写 ctx 哨兵对；
+//      替换体随后 `ldr x3,[x3]` 得到 ctx。
+//   ② callee：在原件前 FS_CALL_SCAN 字节里找「目标跳出函数体」的 bl，
+//      按**去重后的目标数 == 1** 判定（同一 callee 可被多条 bl 调用）→
+//      重编码成 `adrp x9 + add` 覆写 callee 哨兵对；
+//      替换体用 `blr x9` 调用（整段覆写后 BL 的相对偏移不再有效）。
 //      体内自递归 bl 相对自身 PC、拷贝后恒等，不算外部调用。
-// 任一项失败 → 该点整点不写（FAILED_HARVEST），保留原版函数，绝不写会解引用可疑
-// 指针的代码。哨兵值本身定义在 §0。
+// 任一项失败 → 该点整点不写（FAILED_HARVEST），保留原版函数，
+// 绝不写会解引用可疑指针的代码。哨兵值本身定义在 §0。
 constexpr u32 FS_CTX_HARVEST_REG  = 3;   // 替换体里收 ctx 槽用的寄存器（x3）
 constexpr u32 FS_CALL_HARVEST_REG = 9;   // 替换体里收 callee 用的寄存器（x9）
 
@@ -1360,8 +1247,9 @@ constexpr u32 FS_HARVEST_BUF_SIZE = 0xA00;   // ≥ 最大替换体（0x360）+ 
 constexpr u32 FS_ENTRY_PROBE_BYTES = 16;     // 「已被别人打过」的逐字节比对长度
 
 static u8 fs_harvest_buf[FS_HARVEST_BUF_SIZE];
-// 收割源：按 site 直接另读一段原版字节，不复用扫描块 —— 扫描块步长可能装不下整个
-// 收割窗；直接读位置无关，也不用放大 overlap。fs 挂起后这里读到的正是未打补丁的原版字节。
+// 收割源：按 site 直接另读一段原版字节，不复用扫描块 ——
+// 扫描块步长可能装不下整个收割窗；直接读位置无关，也不用放大 overlap。
+// fs 挂起后这里读到的正是未打补丁的原版字节。
 static u8 fs_harvest_orig[FS_CALL_SCAN];
 
 static inline u32 fs_rd32(const u8* p) { u32 v; std::memcpy(&v, p, 4); return v; }
@@ -1389,35 +1277,38 @@ static inline u32 fs_enc_add_imm(u32 rd, u32 rn, u32 imm12)
     return 0x91000000u | ((imm12 & 0xFFFu) << 10) | (rn << 5) | rd;
 }
 
-/* ① ctx 槽地址。返回 0 = 收割失败。 */
+/* ① ctx 槽地址：**候选集**判定。返回 0 = 收割失败。
+ *
+ * 枚举窗口内所有 `(adrp, 配对 ldr)` 组合（配对 = ldr 的 Rn = Rt = adrp 的 Rd，且位置在
+ * adrp 之后，与原版「先取页基址再取表项」的顺序一致），只把**解出的槽落在合理距离内**
+ * 的收进候选；候选去重后恰好 1 个才收。
+ *
+ * 为什么不用「见到第 2 条 adrp 就放弃」：那会让一个与 ctx 无关的 adrp（例如同时载入
+ * 另一个全局表）直接否掉真命中 —— 新固件上多一条无关 adrp 就多一个补丁点静默失效。
+ * 换成候选集后语义更松但**不变式不变**：多个不同候选仍然拒绝，歧义时绝不猜。
+ *
+ * 窗口 0x120 字节 = 72 个字，O(n²) 也只有几千次读；每点只跑一次（3 个点）。 */
 static u64 fs_harvest_ctx_slot(const u8* orig, u64 fn_va)
 {
-    int k = -1;
-    u32 aw = 0;
-    for (u32 o = 0; o < FS_CTX_SCAN; o += 4) {
-        const u32 w = fs_rd32(orig + o);
-        if (!fs_is_adrp(w)) { continue; }
-        if (k >= 0) { return 0; }                    // adrp 不唯一 ⇒ 不收
-        k = (int)o; aw = w;
+    u64 slot = 0;
+    bool any = false;
+    for (u32 o = 0; o + 4 <= FS_CTX_SCAN; o += 4) {
+        const u32 aw = fs_rd32(orig + o);
+        if (!fs_is_adrp(aw)) { continue; }
+        const u32 rd = aw & 0x1Fu;
+        const u64 page = fs_adrp_page(aw, fn_va + o);
+        for (u32 o2 = o + 4; o2 + 4 <= FS_CTX_SCAN; o2 += 4) {
+            const u32 lw = fs_rd32(orig + o2);
+            if (!fs_is_ldr64_imm(lw) || (lw & 0x1Fu) != rd || ((lw >> 5) & 0x1Fu) != rd) {
+                continue;
+            }
+            const u64 s = page + (u64)((lw >> 10) & 0xFFFu) * 8u;
+            if (s <= fn_va || s - fn_va > FS_CTX_MAX_DELTA) { continue; }   // 不合理 ⇒ 不是它
+            if (!any) { any = true; slot = s; }
+            else if (s != slot) { return 0; }    // 两个不同候选 ⇒ 歧义，整点不写
+        }
     }
-    if (k < 0) { return 0; }
-
-    const u32 rd = aw & 0x1Fu;
-    const u64 page = fs_adrp_page(aw, fn_va + (u64)k);
-
-    int j = -1;
-    u32 lw = 0;
-    for (u32 o = (u32)k + 4; o < FS_CTX_SCAN; o += 4) {
-        const u32 w = fs_rd32(orig + o);
-        if (!fs_is_ldr64_imm(w) || (w & 0x1Fu) != rd || ((w >> 5) & 0x1Fu) != rd) { continue; }
-        if (j >= 0) { return 0; }                    // 配对 ldr 不唯一 ⇒ 不收
-        j = (int)o; lw = w;
-    }
-    if (j < 0) { return 0; }
-
-    const u64 slot = page + (u64)((lw >> 10) & 0xFFFu) * 8u;
-    if (slot <= fn_va || slot - fn_va > FS_CTX_MAX_DELTA) { return 0; }
-    return slot;
+    return any ? slot : 0;
 }
 
 /* ② callee 地址：原件里「目标跳出函数体」的 bl 的**去重目标**。返回 0 = 收割失败。
@@ -1440,6 +1331,77 @@ static u64 fs_harvest_callee(const u8* orig, u32 span, u64 fn_va)
     return any ? found : 0;
 }
 
+/* ── 收割结果的可信度校验 ──────────────────────────────────────────────────
+ *
+ * 收割失败是「整点不写」，代价只是该补丁点失效；**收割成功但解出来的指针是错的，
+ * 代价是 fs 在补丁后崩溃 —— 只能靠 JIT 重新编译救砖**。所以写内存之前要把指针链读回来
+ * 核对一遍，把后一种风险降级成前一种。
+ *
+ * 判据（两项都不依赖任何硬编码地址，全部相对 fs 模块基址 fs_code_base）：
+ *   · ctx 槽里存的指针：非 0、8 字节对齐、落在模块窗口内；
+ *   · 该替换体**真正用到**的每个 ctx 槽：非 0、4 字节对齐、落在同一窗口内
+ *     （它们是同一模块里的函数指针，槽收错时必然指向窗口外）。
+ *
+ * 窗口为什么是**双向** ±FS_MODULE_SPAN：fs 的 KIP 段在 .text 之后还是之前不保证，
+ * 单向窗口会在某固件上误杀（代价 = 中文名不生效）；而野指针（0、小整数、无关地址）
+ * 落进这个窗口的概率极低。fs 镜像只有几 MB，64 MB 的跨度已经宽到不会误杀。
+ *
+ * ★ 这一步**无法离线求值**：GOT 槽与 ctx 表在 kip 文件里是压缩/未重定位的
+ *   （拿文件字节读出来是 0x0024CE08… 之类的垃圾），只有目标进程里的运行期镜像才是
+ *   重定位过的真值。所以守卫只复算「候选集唯一」（纯指令分析），
+ *   ctx 链校验的真机行为只能靠日志里的 PATCHED / FAILED (fs ctx harvest) 观察。 */
+constexpr u64 FS_MODULE_SPAN = 0x4000000;      // 模块窗口 ±64 MB
+constexpr u32 FS_CTX_CHAIN_BYTES = 0x40;       // 一次读满 8 个 u64
+/* 要覆盖到**被校验**的最大槽（MBlen = 0x30）。FS_CTX_FLAGS(0x48) 不在校验范围：
+ * 只有 StrUnicode2Oem 用它，而那个实现不读任何函数指针槽（count = 0）。 */
+static_assert(FS_CTX_CHAIN_BYTES >= FS_CTX_MBLEN + 8, "要覆盖到被校验的最大 ctx 槽");
+static_assert((FS_CTX_MBLEN % 8) == 0, "槽偏移按 u64 寻址，必须 8 字节对齐");
+
+static inline bool fs_ptr_in_module(u64 p)
+{
+    const u64 base = fs_code_base;
+    if (base == 0 || p < base) { return (base != 0 && base - p < FS_MODULE_SPAN); }
+    return p - base < FS_MODULE_SPAN;
+}
+
+/* 该替换体真正读到的 ctx 槽（必须是指向模块内的函数指针）。0 结尾。 */
+static const u32* fs_ctx_required_slots(FsBlobImpl impl, u32* count)
+{
+    static const u32 kFatGetNextChar[]  = { FS_CTX_OEM2UNI, FS_CTX_UNI2OEM, FS_CTX_MBLEN, 0 };
+    static const u32 kWideCharCompare[] = { FS_CTX_MBLEN, 0 };
+    static const u32 kNone[]            = { 0 };
+
+    switch (impl) {
+        case FsBlobImpl::FatGetNextChar:  *count = 3; return kFatGetNextChar;
+        case FsBlobImpl::WideCharCompare: *count = 1; return kWideCharCompare;
+        default:                          *count = 0; return kNone;  // StrUnicode2OEM 只读标志位
+    }
+}
+
+/* 读回 ctx 链核对一遍。返回 false ⇒ 该点整点不写（FAILED_HARVEST）。 */
+static bool fs_verify_ctx_chain(Handle handle, FsBlobImpl impl, u64 slot)
+{
+    u64 ctx_ptr = 0;
+    if (R_FAILED(svcReadDebugProcessMemory(&ctx_ptr, handle, slot, sizeof(ctx_ptr)))) {
+        return false;
+    }
+    if ((ctx_ptr & 7u) != 0 || !fs_ptr_in_module(ctx_ptr)) { return false; }
+
+    u32 count = 0;
+    const u32* need = fs_ctx_required_slots(impl, &count);
+    if (count == 0) { return true; }            // 只用标志位的实现：ctx 指针本身已验
+
+    u64 chain[FS_CTX_CHAIN_BYTES / 8] = {};
+    if (R_FAILED(svcReadDebugProcessMemory(chain, handle, ctx_ptr, sizeof(chain)))) {
+        return false;
+    }
+    for (u32 k = 0; k < count; k++) {
+        const u64 p = chain[need[k] / 8];
+        if ((p & 3u) != 0 || !fs_ptr_in_module(p)) { return false; }
+    }
+    return true;
+}
+
 /* 把替换体里的一对哨兵改成 `adrp rd,<页>` + `add rd,rd,#页内偏移` 指向 target。
  * pc 取自占位对自身的真实地址 ⇒ 与页边界无关。 */
 static bool fs_fill_addr_pair(u8* blob, u32 size, u32 sent_a, u32 sent_b,
@@ -1458,20 +1420,21 @@ static bool fs_fill_addr_pair(u8* blob, u32 size, u32 sent_a, u32 sent_b,
 /* 该替换体是否带哨兵占位（需要现场收割）。WideChar_Compare 用满两对：ctx 对 + callee 对。 */
 static bool fs_blob_needs_harvest(FsBlobImpl impl)
 {
-    return impl == FsBlobImpl::StrUnicode2Oem || impl == FsBlobImpl::WideCharCompare
+    return impl == FsBlobImpl::StrUtf16ToOem || impl == FsBlobImpl::WideCharCompare
         || impl == FsBlobImpl::FatGetNextChar;
 }
 
-/* 定位成功后的落地动作：已被别人打过 / 现场收割 / 写内存。返回后 b.result 必然不再
- * 是 NOT_FOUND —— 无论成功还是失败，都表示「本点在这份固件上已定位」，可退役。 */
+/* 定位成功后的落地动作：已被别人打过 / 现场收割 / 写内存。
+ * 返回后 b.result 必然不再是 NOT_FOUND ——
+ * 无论成功还是失败，都表示「本点在这份固件上已定位」，可退役。 */
 static void fs_blob_apply(Handle handle, FsBlobPatch& b, const u8* data, u32 entry, u64 addr,
                           FsSiteSink* sink)
 {
     const u64 site = addr + entry;
     const auto range = fs_blob_range(b.impl);
 
-    // 已被别的途径改过（sigpatch 等）：入口前若干字节 == 替换实现的开头。取 FS_ENTRY_PROBE_BYTES
-    // 字节是为了排除「某版本原函数首指令碰巧相同」的误判。
+    // 已被别的途径改过（sigpatch 等）：入口前若干字节 == 替换实现的开头。
+    // 取 FS_ENTRY_PROBE_BYTES 字节是为了排除「某版本原函数首指令碰巧相同」的误判。
     if (!std::memcmp(data + entry, range.code, FS_ENTRY_PROBE_BYTES)) {
         b.result = PatchResult::PATCHED_FILE;
         if (sink) { sink->add(b.patch_name, site); }
@@ -1497,6 +1460,12 @@ static void fs_blob_apply(Handle handle, FsBlobPatch& b, const u8* data, u32 ent
             b.result = PatchResult::FAILED_HARVEST;
             return;
         }
+        // 收割成功 ≠ 指针可信：把 ctx 链读回来核对一遍（见 fs_verify_ctx_chain 的说明）。
+        // 不通过 ⇒ 整点不写，绝不写会解引用野指针的代码（那会让 fs 崩溃、只能 JIT 救砖）。
+        if (!fs_verify_ctx_chain(handle, b.impl, slot)) {
+            b.result = PatchResult::FAILED_HARVEST;
+            return;
+        }
         std::memcpy(fs_harvest_buf, range.code, range.size);
         if (!fs_fill_addr_pair(fs_harvest_buf, range.size,
                                FS_CTX_SENTINEL_A, FS_CTX_SENTINEL_B,
@@ -1518,7 +1487,7 @@ static void fs_blob_apply(Handle handle, FsBlobPatch& b, const u8* data, u32 ent
         to_write = fs_harvest_buf;
     }
 
-    // todo: log failed writes, although this should in theory never fail
+    // todo: 记录写失败（理论上不应发生）
     if (R_FAILED(svcWriteDebugProcessMemory(handle, to_write, site, range.size))) {
         b.result = PatchResult::FAILED_WRITE;
     } else {
@@ -1528,13 +1497,14 @@ static void fs_blob_apply(Handle handle, FsBlobPatch& b, const u8* data, u32 ent
 }
 
 /* ── 车道快筛（blob 的位置预筛）───────────────────────────────────────────────
- * blob 模板长且唯一，加谓词不划算，本来只能逐条把整段扫一遍（16 条 × 段长/4 次字节
- * 比对）。但每条模板的**偏移 0 或偏移 4** 上几乎都有确定字节：于是每个候选位置只需
- * 两次取字节（data[i]、data[i+4]）各查一次 256 项位图、按位与，就得到「本位置可能是
- * 哪几条 blob 的起点」。位图 bit = 条目下标，**未用该车道的条目位恒为 1**（不约束）
+ * blob 模板长且唯一，加谓词不划算，本来只能逐条把整段扫一遍（16 条 × 段长/4 次字节比对）。
+ * 但每条模板的**偏移 0 或偏移 4** 上几乎都有确定字节：
+ * 于是每个候选位置只需两次取字节（data[i]、data[i+4]）各查一次 256 项位图、按位与，
+ * 就得到「本位置可能是哪几条 blob 的起点」。
+ * 位图 bit = 条目下标，**未用该车道的条目位恒为 1**（不约束）
  * ⇒ 两个车道可以无干扰地并进同一个掩码。
  * 筛子字节取自模板的确定字节 ⇒ 模板整体匹配必然蕴含筛子命中，快筛不会漏。
- * 实测每位置候选条目数 0.51~0.56（26 份语料），相对逐条线性扫描压缩约 28 倍。 */
+ * 实测每位置候选条目数 0.51~0.56，相对逐条线性扫描压缩约 28 倍。 */
 constexpr u32 FS_LANE_COUNT = 2;         // 只取模板偏移 0 / 4 两处当筛子
 constexpr u32 FS_FILTER_NONE = 0xFF;     // 偏移 0 与 4 都是通配槽 ⇒ 该条目不做预筛
 /* 位置循环的右界余量：车道 1 的取样点在 i+4，所以必须先给这 4 字节留位；
@@ -1567,19 +1537,20 @@ static void fs_build_lanes(void)
     }
 }
 
-/* 整函数替换定位器：与 fs_inst_scan 同一套 REGEX_SKIP 通配规则，但写的是替换实现的
- * 整段代码。
+/* 整函数替换定位器：与 fs_inst_scan 同一套 REGEX_SKIP 通配规则，
+ * 但写的是替换实现的整段代码。
  *
  * ★ 步进取字长：blob 条目的 entry_offset 都是字长的倍数，命中处是 AArch64 函数入口
- *   （字对齐），块基址也对齐 ⇒ 块内合法命中下标 i 必为字长的倍数。按字长步进不会漏掉
- *   任何合法命中，只跳过「就算命中也会写到非对齐地址」的伪命中。
+ *   （字对齐），块基址也对齐 ⇒ 块内合法命中下标 i 必为字长的倍数。
+ *   按字长步进不会漏掉任何合法命中，只跳过「就算命中也会写到非对齐地址」的伪命中。
  *
- * ★ 遍历次序：位置外层、条目内层（条目由车道掩码挑出，按下标升序）。每个条目落地在
- *   「该条目在全段里最早的合法命中」，与逐条扫描逐位一致；只有 sink 的登记先后变了
- *   （仅影响 log 里站点列表的排列）。
+ * ★ 遍历次序：位置外层、条目内层（条目由车道掩码挑出，按下标升序）。
+ *   每个条目落地在「该条目在全段里最早的合法命中」，与逐条扫描逐位一致；
+ *   只有 sink 的登记先后变了（仅影响 log 里站点列表的排列）。
  *
- * ★ 同族退役：任一变体定位成功 ⇒ 同族其余变体在这份固件上不可能命中（互斥），就地
- *   从 pending 里摘掉，不再为它们做字节比对。粒度是「本块内即时」+「跨块持久」。 */
+ * ★ 同族退役：任一变体定位成功 ⇒ 同族其余变体在这份固件上不可能命中（互斥），
+ *   就地从 pending 里摘掉，不再为它们做字节比对。
+ *   粒度是「本块内即时」+「跨块持久」。 */
 static void fs_blob_scan(Handle handle, const u8* data, size_t data_size, u64 addr,
                          std::span<FsBlobPatch> blobs, FsSiteSink* sink)
 {
@@ -1676,8 +1647,7 @@ const char *fs_codepage_patch_result = "default";
  * fs 脱附之后统一落盘 —— fs 被附加调试挂起期间，任何写 SD 的操作（要经过 fs 服务）
  * 都会永久阻塞。补丁真挂死时日志是空的，此时该值停在**最后进入的那个函数组**上
  * （start → <组名> → success），它指向元凶。
- * 注意：这里不再有 stage 语义 —— 条目一律全量应用，二分开关只有
- * [options] fs_codepage=0（整份跳过）。 */
+ * 条目一律全量应用，唯一的二分开关是 [options] fs_codepage=0（整份跳过）。 */
 static void fs_progress(const char *label)
 {
     fs_codepage_patch_result = label;
@@ -1689,10 +1659,10 @@ constexpr u32 FS_MAX_PROCESS   = 0x50;               // 进程表容量
 constexpr u64 FS_TEXT_MIN_SIZE = 0x100000;           // 主 .text 段最小尺寸（1 MiB）
 
 /* §7 入口：fs 编码补丁主流程（pattern 驱动 + 函数组二级表）。
- * 偏移来自每条 pattern 在 fs .text 里的搜索结果，补丁字节由改写规则从命中指令现场
- * 算出；未命中只记 NOT_FOUND，绝不写错地方。
- * 只处理第一个 ≥ FS_TEXT_MIN_SIZE 的 Rx/CodeStatic 段（fs 主 .text，同时就是模块
- * 基址，log 里的站点偏移与 Ghidra 的 VA 同口径）。 */
+ * 偏移来自每条 pattern 在 fs .text 里的搜索结果，
+ * 补丁字节由改写规则从命中指令现场算出；未命中只记 NOT_FOUND，绝不写错地方。
+ * 只处理第一个 ≥ FS_TEXT_MIN_SIZE 的 Rx/CodeStatic 段
+ * （fs 主 .text，同时就是模块基址，log 里的站点偏移与 Ghidra 的 VA 同口径）。 */
 void fs_codepage_patch(void)
 {
     Handle handle{};
@@ -1745,8 +1715,8 @@ void fs_codepage_patch(void)
 
                 for (u64 sz = 0; sz < mem_info.size; sz += READ_BUFFER_SIZE - overlap_size) {
                     // 每块开始前刷新「已解决族」快照；全部补丁点都定位完毕就直接收工 ——
-                    // 剩下的块只是在读内存、建位面、逐组空走。补丁点的落地位置都在 .text
-                    // 的 46%~56% 区间，尾部近一半的块原本全是白跑。
+                    // 剩下的块只是在读内存、建位面、逐组空走。
+                    // 补丁点的落地位置都在 .text 的 46%~56% 区间，尾部近一半的块原本全是白跑。
                     fs_fam_done = fs_fam_collect();
                     if (!fs_any_live()) {
                         break;
@@ -1763,7 +1733,7 @@ void fs_codepage_patch(void)
                     const u32 chunk_size = (u32)(actual_size + overlap_size);
                     const u32 sink_begin = fs_sites.n;
 
-                    // 本块只算一次谓词位图，12 个函数组共享。
+                    // 本块只算一次谓词位图，所有函数组共享。
                     // 谓词集合按「还需扫描的条目」收缩，越往后位图越便宜。
                     fs_build_pred_bits(buffer, chunk_size, fs_pred_need_mask());
 
@@ -1813,30 +1783,71 @@ void fs_codepage_patch(void)
 
 void fs_codepage_write_log(const char* log_path)
 {
-    // 挂死定位：补丁真把 fs 打挂时日志写不出来，此时该值停在最后一个进入的函数组上。
+    // 挂死定位标记收尾：main 在附加前写入的 fs_codepage_phase=attaching 在此覆写为
+    // done（fs 已脱附，可安全落盘）。停在 attaching 且没有 fs_codepage_patch_result
+    // 行，才是挂死/崩溃在补丁流程内的证据。
+    ini_puts("debug", "fs_codepage_phase", "done", log_path);
+
+    // 补丁流程的最终结论：success / 失败原因 / 挂死定位 —— 补丁真把 fs 打挂时日志写
+    // 不出来，此值停在最后一个进入的函数组名上（fs_codepage.h 的 fs_progress）。
     ini_puts("debug", "fs_codepage_patch_result", fs_codepage_patch_result, log_path);
 
-    // 精简后的逐条结果：**只记已定位的条目**（打过 / 已被打过 / 收割或写入失败），
-    // 未命中的只汇总个数。31 条里大部分是跨版本互斥变体，在一份固件上本就该 0 命中
-    // （"Unpatched" 是安全失败，不是错误），逐条写全是噪音。
-    // 「哪个补丁点没落地」看 [fs_codepage_sites] 即可：同名功能前缀（族）的任一成员
-    // 出现在站点表里就说明该点已落地；整族缺席才是新固件未适配。
-    u32 unmatched = 0;
+    // 逐条结果**只记已定位的条目**（打过 / 已被打过 / 收割或写入失败）。
+    // 未命中**不计数不列表**：大部分条目是跨版本互斥变体，在一份固件上本就该 0 命中
+    // （"Unpatched" 是安全失败，不是错误）——逐条写或给个总数都是噪音，还会被误读成
+    // 「补丁没打全」。
+    // 「哪个补丁点没落地」看 [fs_codepage_missing]：补丁点 = 族（条目名版本范围之前的
+    // 功能前缀），族内任一成员被定位（含写失败/收割失败 —— pattern 找到了位置）即视为
+    // 该点落地；**整族缺席**才是要关注的信号（新固件未适配 / 定位失败）。
+    // 期望值：[debug] fs_codepage_missing_families == 0。
     for (auto& p : fs_inst_patches) {
-        if (p.result == PatchResult::NOT_FOUND) {
-            unmatched++;
-        } else {
+        if (p.result != PatchResult::NOT_FOUND) {
             ini_puts("fs_codepage", p.patch_name, patch_result_to_str(p.result), log_path);
         }
     }
     for (auto& b : fs_blob_patches) {
-        if (b.result == PatchResult::NOT_FOUND) {
-            unmatched++;
-        } else {
+        if (b.result != PatchResult::NOT_FOUND) {
             ini_puts("fs_codepage", b.patch_name, patch_result_to_str(b.result), log_path);
         }
     }
-    ini_putl("debug", "fs_codepage_unmatched", (long)unmatched, log_path);
+
+    // 逐族缺席汇总。fs_build_families() 没跑过（补丁被 [options] fs_codepage=0 或版本
+    // 门控跳过）时不写 —— 那时逐条结果全是初始 NOT_FOUND，会把「根本没扫」误报成
+    // 「全族缺席」；没扫这件事由上面的 fs_codepage_patch_result 交代。
+    // 条目名守卫（NAME_RE）保证功能前缀非空，族数远小于 FS_FAM_COUNT，
+    // 故不处理 FS_FAM_NONE / 族表满的退化情形。
+    if (fs_fam_used > 0) {
+        bool fam_located[FS_FAM_COUNT]{};
+        u32 fam_missing_n[FS_FAM_COUNT]{};
+        for (u32 k = 0; k < std::size(fs_inst_patches); k++) {
+            const u32 fam = fs_pat_fam[k];
+            if (fam >= FS_FAM_COUNT) { continue; }
+            if (fs_inst_patches[k].result != PatchResult::NOT_FOUND) {
+                fam_located[fam] = true;
+            } else {
+                fam_missing_n[fam]++;
+            }
+        }
+        for (u32 k = 0; k < std::size(fs_blob_patches); k++) {
+            const u32 fam = fs_blob_fam[k];
+            if (fam >= FS_FAM_COUNT) { continue; }
+            if (fs_blob_patches[k].result != PatchResult::NOT_FOUND) {
+                fam_located[fam] = true;
+            } else {
+                fam_missing_n[fam]++;
+            }
+        }
+
+        u32 missing = 0;
+        for (u32 k = 0; k < fs_fam_used; k++) {
+            if (!fam_located[k]) {
+                missing++;
+                // 值 = 该族仍 NOT_FOUND 的条目数（跨版本变体越多数字越大，仅作参考）
+                ini_putl("fs_codepage_missing", fs_fam_key[k], (long)fam_missing_n[k], log_path);
+            }
+        }
+        ini_putl("debug", "fs_codepage_missing_families", (long)missing, log_path);
+    }
 
     // 命中站点的偏移（相对 fs 主 .text 基址，也就是模块基址），可直接逐点核对。
     for (u32 k = 0; k < fs_sites.n; k++) {

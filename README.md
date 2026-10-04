@@ -1,116 +1,166 @@
-# fs-codepage（独立 fs UTF-8 补丁模块）
+# fs-codepage
 
-从 sys-patch fork 拆出的**独立**系统模块，只做一件事：把 fs 的 CP932 (Shift-JIS)
-代码页转换例程替换为 UTF-8 <-> UTF-16，让 FAT/exFAT 卷支持中文等 3 字节 UTF-8 文件名。
+Switch 大气层系统模块：把文件系统驱动 `fs` 的 CP932（日文）字符集转换替换为 UTF-8 ⇄ UTF-16，
+使 FAT / exFAT 卷支持中文等 3 字节 UTF-8 文件名。
 
-设计动机：该功能目前寄生在 sys-patch fork 里，改动较大、不确定能否合并上游。
-本工程把它拆成单独的补丁插件，作为**备选方案**——可与**原版（upstream）sys-patch
-并存安装**，sys-patch 项目本体不做任何改动。
+[![Horizon OS](https://img.shields.io/badge/Horizon%20OS-10.0.0%2B-3c7abf?style=flat-square)](doc/patch-design.md)
+[![Corpus](https://img.shields.io/badge/verified-full%20corpus-3c7abf?style=flat-square)](scripts/fs_version_matrix.py)
+[![Build](https://img.shields.io/badge/build-guard%20enforced-3c7abf?style=flat-square)](scripts/check_patch_sizes.py)
 
-**支持范围：Horizon OS 10.0.0 及以上（实测覆盖 10.x–22.x，共 40 条变体 / 14 个补丁族）。**
-条目的版本范围按**逐小版本实测端点**命名（`10.0.0-14.1.2` / `16.0.0+` /
-`10.0.0-14.1.2,21.0.0+` 等；fs 驱动在大版本内也会换，major 粒度命名会失真）。
-低于 10.0.0 的 fs 属于更早的代码生成，**不在支持范围**——运行期有版本门控
-（`< 10.0.0` 整份跳过，结果记 `unsupported_fw_version`；取不到版本时放行）。
+基于 sys-patch 框架实现，与 sys-patch **可并存安装**（打补丁的函数不相关）。
 
-## 与 sys-patch 的共存（兼容性）
+## 目录
 
-| 组合 | 行为 |
+- [概述](#概述)
+- [特性](#特性)
+- [支持范围](#支持范围)
+- [安装](#安装)
+- [配置](#配置)
+- [日志与排障](#日志与排障)
+- [从源码构建](#从源码构建)
+- [项目结构](#项目结构)
+- [已知限制](#已知限制)
+- [许可](#许可)
+
+---
+
+## 概述
+
+官方系统的 `fs` 驱动按 CP932 处理文件名，FAT / exFAT 卷上的中文名因此无法创建，或可枚举但无法打开。
+本模块在 boot2 阶段对 `fs` 进程做一次内存补丁，替换其代码页转换链，并修正配套的字符宽度处理与通配符匹配；
+补丁完成后模块退出，不常驻、不修改卷上的数据，重启即恢复原状。
+
+补丁点为**全表 pattern 驱动**，运行期不含写死的 fs 偏移或全局地址：定位靠字节模板，改写靠语义等价规则，
+随版本变化的值（代码页上下文槽、外部 callee）在打补丁时从被覆盖的原函数体现场收割。
+收割失败则该点整组跳过，不写入任何字节。
+
+## 特性
+
+- **中文文件名可用** —— 创建、枚举、打开、读取、重命名、删除（3 字节 UTF-8）。
+- **零硬编码偏移** —— 定位与收割全部在运行期完成，跨版本自适应。
+- **可与 sys-patch 并存** —— Title ID 不同，补丁站点函数级不相交。
+- **构建期强制守卫** —— 每次 `make` 校验替换体尺寸与洞容量、位置无关性、pattern 语法、
+  条目命名、族内互斥、规则引用，任一失败即构建失败。
+- **失败安全** —— pattern 未命中绝不写入；生效粒度是整份，不存在半成品状态。
+- **可停用** —— `[options] fs_codepage=0` 完全跳过，排障路径唯一。
+
+## 支持范围
+
+| 项目 | 说明 |
 | --- | --- |
-| 原版 upstream sys-patch + 本模块 | **推荐**。补丁站点函数级不相交（upstream 的 fs 条目 noacidsigchk/noncasigchk/nocntchk 碰的是别的函数），互不干扰 |
-| fork sys-patch（自带 fs codepage）+ 本模块 | 不要同时开。在 sys-patch 的 `/config/sys-patch/config.ini` 里设 `fs_codepage=0`，把编码补丁完全交给本模块；或者反过来禁用本模块 |
-| 只有本模块 | 只修 fs 代码页，其余签名补丁等由 sys-patch 负责（或都不打） |
-
-竞争处理：fs 的调试器（`svcDebugActiveProcess`）是互斥的，两个模块开机同时跑时
-输家会拿不到 fs。本模块 main 里做了退避重试（25 次 × 200ms，最长 5s）——
-`fs_codepage_patch()` 找不到 fs 时结果停在 `"start"` 且每次进入都会重置全部状态，
-因此重跑是安全的。补丁写入本身是 fail-safe 的：pattern 未命中绝不写。
+| 已验证 | Horizon OS 10.0.0 – 22.5.0，逐小版本实测，全部补丁点在每份固件上命中 |
+| 不支持 | ≤ 9.x：该代 `fs` 代码生成不同，模块整份跳过（日志 `unsupported_fw_version`） |
+| 未验证 | ≥ 23.0.0：需新 master key 才能解包固件实测 |
 
 ## 安装
 
-把 `out/atmosphere/` 整个拷到 SD 卡根目录（或 `dist` 出的 zip 解压）：
+解压 `fs-codepage-sysmodule.zip`，拷至 SD 卡根目录：
 
 ```
-atmosphere/contents/42000000000000E0/
+SD:/atmosphere/contents/42000000000000E0/
 ├── exefs.nsp
 ├── toolbox.json
 └── flags/boot2.flag
 ```
 
-- Title ID `42000000000000E0`，与 sys-patch（`420000000000000B`）不同，可并存。
-  若与其他自制系统模块撞号，改 `sysmod/fs-codepage.json`、`sysmod/toolbox.json`
-  和 `sysmod/Makefile` 里的 `TITLE_ID` 三处即可。
-- 开机（boot2）自动运行一次，打完补丁即退出。
+- `flags/boot2.flag` 使模块在 boot2 阶段自动运行一次。
+- 模块需访问 `fs` 进程内存，NPDM 已申请 `debug_flags.force_debug` 与相应 syscall。
 
-## 配置与日志
+**验证**：开机一次，在 FAT32 / exFAT 分区创建中文名文件（如 `测试.txt`）并确认可打开；
+再检查 `/config/fs-codepage/log.ini` 的 `[debug] fs_codepage_patch_result` 为成功状态。
 
-`/config/fs-codepage/config.ini`（首次运行自动生成）：
+## 配置
+
+`/config/fs-codepage/config.ini`（首次运行自动生成，缺键补默认值）：
 
 ```ini
 [options]
-patch_sysmmc=1
-patch_emummc=1
-enable_logging=1
-fs_codepage=1   ; 唯一开关：置 0 整份跳过（排障/救砖用）
+fs_codepage=1      ; 唯一开关：置 0 整份跳过补丁（排障 / 救砖）
+enable_logging=1   ; 写 log.ini
+patch_sysmmc=1     ; 允许在 sysMMC 上打补丁
+patch_emummc=1     ; 允许在 emuMMC 上打补丁
 ```
 
-日志在 `/config/fs-codepage/log.ini`：`[fs_codepage]` 逐条结果、
-`[fs_codepage_sites]` 命中站点偏移、`[debug]` 诊断（含挂死时最后进入的函数组）。
-与 sys-patch 的 `/config/sys-patch/` 完全分开。
+`patch_sysmmc` / `patch_emummc` 按当前启动介质二选一生效；两者都关则补丁整体不执行
+（结果不写入日志，表现为补丁未生效）。
 
-## 构建
+## 日志与排障
+
+日志位于 `/config/fs-codepage/log.ini`：
+
+| 段 | 内容 |
+| --- | --- |
+| `[stats]` | 模块版本、构建时间、固件版本、是否 emuMMC、打补丁耗时 |
+| `[debug]` | `fs_codepage_patch_result`（总体结论）、`fs_codepage_phase`、`fs_codepage_missing_families` |
+| `[fs_codepage]` | 逐条结果：`Patched (sys-patch)` / `Unpatched` / `Failed (fs ctx harvest)` / `Failed (svcWriteDebugProcessMemory)` |
+| `[fs_codepage_missing]` | 整族缺席的补丁点数（**期望 0**），键 = 族名 |
+| `[fs_codepage_sites]` | 命中站点在 fs 内的偏移 |
+
+排障顺序：
+
+1. `[debug] fs_codepage_patch_result` —— `disabled_by_config` = 开关置 0；
+   `unsupported_fw_version` = 固件低于支持下限；停在 `attaching` 且无结论 = 卡在补丁流程内。
+2. `[fs_codepage_missing_families]` 应为 0；非 0 时由 `[fs_codepage_missing]` 指出缺席的族。
+3. 异常时唯一逃生路径：`[options] fs_codepage=0`。
+
+## 从源码构建
+
+环境：[devkitPro](https://devkitpro.org/) + libnx（C++23）、`python`（守卫需要）。
+
+在 devkitPro 的 msys2 登录 shell 中从**仓库根**执行：
+
+```bash
+make                     # 构建 + 自动跑守卫，产物收进 out/
+make dist                # 额外出 fs-codepage-sysmodule.zip
+make check-patch-sizes   # 只跑守卫
+make clean
+```
+
+产物：`out/atmosphere/contents/42000000000000E0/{exefs.nsp, toolbox.json, flags/boot2.flag}`。
+
+> 与其它自制模块 Title ID 冲突时，修改 `sysmod/fs-codepage.json`、`sysmod/toolbox.json`
+  与 `sysmod/Makefile` 的 `TITLE_ID` 三处后重新构建。
+
+**构建期守卫**（`scripts/check_patch_sizes.py`，每次构建自动运行，任一失败即构建失败）：
+
+- 替换体 `label delta == ELF 符号尺寸` 且 ≤ 该补丁点的洞（余量不足报 `ZERO SLACK` / `HOLE OVERFLOW`）；
+- 替换体位置无关（禁 MOVZ/MOVK 宽常量、字面量池、外部 `BL`、非 `adrp+add` 的 PC 相对引用）；
+- 从源码文本解析补丁表：条目名合规、pattern 语法、cond/patch 配套、族内互斥、规则被引用；
+- 收割判据与 ctx 链校验在 C++ 与 Python 两侧一致；参考固件上每个 pattern 恰好命中 1 次。
+
+修改补丁表或条目名后，需再跑离线版本矩阵（依赖仓库外的固件语料）：
+
+```bash
+python scripts/fs_version_matrix.py --min 10.0.0 --variant both
+# 期望：0 问题，且每份固件上每个族都覆盖
+```
+
+## 项目结构
 
 ```
-C:\devkitPro\msys2\usr\bin\bash.exe -lc 'cd /d/Design/NS/fs-codepage && make'
-```
-
-- 需要 devkitPro/libnx，C++23。
-- 每次构建自动跑 `sysmod/tools/check_patch_sizes.py` 守卫（7 个替换体尺寸 ==
-  ELF 符号尺寸且 ≤ 洞、pattern 表结构合法、参考固件上恰好命中 1 次、位置无关），
-  任一失败构建即失败。
-- `make dist` 额外产出 `fs-codepage-sysmodule.zip`。
-
-## 布局
-
-```
-Makefile                 根：只管 sysmod，收集 out/
-common/minIni/           INI 库（与 sys-patch 同源）
+Makefile                      根：只管 sysmod，产物收集到 out/
+common/minIni/                INI 库
 sysmod/
-  Makefile               TARGET=fs-codepage, TITLE_ID=42000000000000E0
-  fs-codepage.json       NPDM（name/title_id 与 sys-patch 不同）
-  toolbox.json           Toolbox 列表项
-  src/main.cpp           模块骨架：配置、调度（重试）、日志
-  src/fs_codepage.cpp    补丁本体（表 + 7 个替换体；自 sys-patch fork 复制后独立演进）
-  src/fs_codepage.h      API
-  src/patch_types.h      pattern/patch 基元（自 sys-patch fork 原样复制）
-  tools/check_patch_sizes.py  构建期守卫（原样复制）
-doc/                     设计文档与逆向结论（不参与构建），索引 doc/README.md
-scripts/                 离线工具：固件审计等（不参与构建，需时手动跑）
+  Makefile                    TARGET=fs-codepage, TITLE_ID=42000000000000E0
+  fs-codepage.json            权限声明（NPDM）
+  toolbox.json                Toolbox 列表项
+  src/main.cpp                骨架：配置、调度、日志
+  src/fs_codepage.cpp         补丁本体（表 + 整函数替换体）
+  src/fs_codepage.h           接口
+  src/patch_types.h           pattern / patch 基元
+doc/                          设计文档与逆向结论（不参与构建）
+scripts/                      构建期守卫 + 离线工具
+AGENTS.md                     硬约束与改动纪律
 ```
 
-`fs_codepage.*` / `patch_types.h` / `check_patch_sizes.py` 拆分时自 sys-patch fork 逐字节复制；
-**2026-09-30 起本工程是权威侧**（改名 + 12/13 覆盖已改动 `fs_codepage.cpp` 与
-`check_patch_sizes.py`），fork 侧停在旧版。四文件若需同步，方向改为本工程 → fork。
+## 已知限制
 
-## 文档与历史（2026-09-29 从 sys-patch 迁来，本工程单独维护）
+- **4 字节字符（emoji 等）**：比较值只取前 3 字节，前 3 字节相同的不同字符会判为同名。
+  3 字节汉字（U+0800–FFFF）零碰撞。
+- **FAT32 8.3 短名**：宽度钳制为 2 以避免死循环，短名空间仍按 CP932 行为估算，PC 侧可能识别不出短名。
+- **半角片假名**：CP932 ⇄ UTF-8 往返丢失，属已知取舍。
+- **≤ 9.0.0 不支持**；**≥ 23.0.0 未验证**（待新 master key）。
 
-文档与逐日工作日志已随代码迁到本工程并整理过一遍，`D:/Design/NS/sys-patch` 保持原样、
-**今后不再同步**。整理口径：**只保留最终设计思路与原理**，过程性论证（演进史全文、
-逐轮 Ghidra 笔记、事故复盘、退役脚本）已删除，其结论并入保留文档 —— 原始过程仍可从本仓库
-git 历史（提交 `eff8a96`）或 sys-patch 的 `dev/fs-codepage` 分支查到。
+## 许可
 
-```
-AGENTS.md              智能体入口：硬不变量 / 构建 / 布局 / 文档地图
-doc/README.md          文档索引（先读它）
-doc/patch-design.md    ★ 权威：原理 + 实现 + 守卫 + 排障
-doc/design-decisions.md  设计现状 + 决策台账
-doc/fw-compat.md       版本兼容选型 + 固件审计工具用法
-doc/{fs-object-model,interface-map,encoding-choice,replace-fn-eval,test-plan}.md
-doc/{callback-tables.md,fs_structs.h}   参考数据
-scripts/                 离线工具（fs_fw_audit.py / fs_pat_hits.py / fs_version_matrix.py /
-                         _fs_dis.py / _dump_blobs.py / _name_collision_check.py）
-.workbuddy/memory/     逐日工作日志（13~29 日）+ MEMORY.md 长期备忘
-```
-
-- 离线工具的默认路径已按本工程校正（读 `sysmod/fs-codepage.elf`、`sysmod/src/fs_codepage.cpp`）。
-- 26 份固件语料与离线验证脚本（`D:/Game/NS/firmware/_audit/`）体积过大，**仍在仓库外**。
+本项目使用 `MIT` 开源许可。

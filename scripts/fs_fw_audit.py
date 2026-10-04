@@ -95,8 +95,8 @@ BASE_FS = pick(os.environ.get("FS_KIP1", ""),
                os.path.join(SCRIPT_DIR, "19.exfat.FS.kip1"),
                os.path.join(RE_DIR, "FS_ghidra_1", "bin", "19.exfat.FS.kip1"))
 
-# 本仓库内的补丁表文件（fs 表权威）。2026-09-19 起 fs 表在 src/fs_codepage.cpp
-# （原 main.cpp 的表已拆出）；脚本被拷到仓库外时依次尝试候选路径，**仓库里的那份优先**。
+# 本仓库内的补丁表文件（fs 表权威，在 src/fs_codepage.cpp）。脚本被拷到仓库外时依次尝试
+# 候选路径，**仓库里的那份优先**。
 MAIN_CPP = pick(os.environ.get("FS_TABLE_CXX", ""),
                 os.path.join(SCRIPT_DIR, "..", "sysmod", "src", "fs_codepage.cpp"),
                 "D:/Design/NS/fs-codepage/sysmod/src/fs_codepage.cpp",
@@ -110,7 +110,7 @@ ELF_PATH = pick(os.environ.get("FS_ELF", ""),
 # 唯一待解包的固件元数据 title：BootImagePackage（普通启动）
 BOOT_TITLE = "0100000000000819"
 
-# 七个"整函数替换"补丁位在**基线**（19.exfat.FS.kip1）上的可用空间（洞）。
+# 各"整函数替换"补丁位在**基线**（19.exfat.FS.kip1）上的可用空间（洞）。
 # 换目标固件版本必须重推 —— 这里只用于在报告里提示"新位置洞是否够用"。
 # 洞 = 从补丁点起可以安全覆写的字节数。来源是 Ghidra 函数边界，换固件必须重推。
 # boundary = 限制这个洞的那个地址（通常是紧邻的下一个函数入口；若本函数体之后
@@ -118,7 +118,7 @@ BOOT_TITLE = "0100000000000819"
 # 新洞 = 新 boundary − 新补丁点偏移 —— 比"扫描下一个函数序言"的启发式可靠得多
 # （转换器那类叶子函数没有栈序言，启发式会漏掉边界并高估洞）。
 # ⚠️ 这里的 hole 是**基线洞**（用于投影比对）；构建期守卫
-# （sysmod/tools/check_patch_sizes.py 的 FUNCTIONS 表）用的是跨 26 份变体的
+# （scripts/check_patch_sizes.py 的 FUNCTIONS 表）用的是跨 26 份变体的
 # **全局最小洞**（p29 0xB0、M8 0x240 等），两者口径不同、都要维护。
 # 键 = 基线偏移（= blob 模板在基线 fs 上的唯一命中点）。
 FUNC_HOLES = {
@@ -128,9 +128,9 @@ FUNC_HOLES = {
                   note="down to 0x71000fee00 OEMCharWidth"),
     0xFEE40: dict(symbol="patch_is_oem_mb_char", boundary=0xFEE90, hole=0x50,
                   note="自己 extent 0xfee40..0xfee8c + 0xfee8c 的 udf，须保留 0xfee90 回调 stub"),
-    0xF5840: dict(symbol="patch_str_unicode2oem", boundary=0xF5960, hole=0x120,
+    0xF5840: dict(symbol="patch_str_utf16_to_utf8", boundary=0xF5960, hole=0x120,
                   note="down to 0x71000f5960 Str_OEM2Unicode"),
-    0xF7C10: dict(symbol="patch_stringdesc_toupper", boundary=0xF7CE0, hole=0xD0,
+    0xF7C10: dict(symbol="patch_fsstring_toupper", boundary=0xF7CE0, hole=0xD0,
                   note="down to 0x71000f7ce0 PFCODE_CP932_ConvertWidth；"
                        "14.x/15.x 实测最小 0xB0（守卫按全局最小 0xB0 卡）"),
     0xF4770: dict(symbol="patch_widechar_compare", boundary=0xF4AD0, hole=0x360,
@@ -415,15 +415,15 @@ CALL_RE = re.compile(
 PROGRESS_RE = re.compile(r'fs_(?:stage|progress)\(\s*"([^"]+)"\s*\)')
 
 # --- pattern 驱动的两级表：fs_fn_groups[] / fs_inst_patches[] / fs_blob_patches[]
-# 与 sysmod/tools/check_patch_sizes.py 的解析保持一致；`.` 是通配（REGEX_SKIP）。
-# ⚠️ 表在 **fs_codepage.cpp**（2026-09-19 从 main.cpp 拆出），改表格式时本文件要同步。
-# 条目名 = `<功能名>_<版本范围>`（如 fs_cp_makeshortname_15-20；
-#           2026-09-30 起范围按**大版本**写：`12` / `12-15` / `16+`，`,` 分段多段）。
+# 与 scripts/check_patch_sizes.py 的解析保持一致；`.` 是通配（REGEX_SKIP）。
+# ⚠️ 表在 **fs_codepage.cpp**，改表格式时本文件要同步。
+# 条目名 = `<功能名>_<版本范围>`（如 `fs_cp_fat_makeshortname_15.0.0-20.5.0`，
+#           范围按**实测精确 x.y.z 粒度**写，`10.0.0-14.1.2,21.0.0+` 这种 `,` 分段多段）。
 #           故名字允许 `. + - ,`——正则字符集必须包含，否则整条静默丢掉。
 # FsInstPatch = { name, pattern, inst_offset, cond, patch }
-#            （P1 的 `rules_applied<X>` 列、2026-09-20 的 stage_idx 与 needs_wide_cmp
-#              均已删除：谓词位图保证「已打过」分支不可达，条目一律全量应用，
-#              pred_idx 由 cond 反查（fs_pred_index），表里没有这一列）
+#            （没有 `rules_applied<X>` / `stage_idx` / `needs_wide_cmp` 列：谓词位图保证
+#              「已打过」分支不可达，条目一律全量应用；pred_idx 由 cond 反查
+#              （fs_pred_index），表里没有这一列）
 # FsBlobPatch = { name, pattern, entry_offset, FsBlobImpl::X }
 # FsFnGroup   = { label, pat_begin, pat_end, blob_begin, blob_end }
 FS_PAT_RE = re.compile(
@@ -442,9 +442,8 @@ def parse_fs_pattern(s):
     （它在看到 '.' 时 `s += 2` 吃掉两个点），单个 '.' 非法 —— 与系统标题补丁表、
     构建期守卫 `check_patch_sizes.py::parse_pattern` 三者一致。
 
-    历史坑：这里曾经按"一个 `.` 一槽"解析，与 str2hex 差一倍槽数 —— 表现是
-    **凡是通配符不在模板末尾的条目一律 0 命中**（2026-09-30 审计 10.x~13.x 老固件时
-    才发现：31 条里 24 条被误报"这份固件上 0 命中"，连 14.1.2 自己都只命中 4 条）。
+    ⚠️ 写成「一个 `.` 一槽」会让槽数翻倍，而通配符不在模板末尾的条目**全部 0 命中**
+    （表现为「这份固件上大面积未命中」，很容易误读成补丁失效）。
     改本函数时同步看 check_patch_sizes.py。
     """
     body = s[2:]
@@ -1394,7 +1393,7 @@ def write_report(path, fs_path, base_path, sites, results, dom_delta, dom_count,
     L.append("1. 对每个 `FUZZY`/`AMBIGUOUS` 点人工核对第 2 节的指令对照，"
              "确认寄存器与语义没变；")
     L.append("2. 对函数替换点，用新偏移重推「洞」（到下一个存活函数的距离），"
-             "并更新 `sysmod/tools/check_patch_sizes.py` 的 `FUNCTIONS` 表；")
+             "并更新 `scripts/check_patch_sizes.py` 的 `FUNCTIONS` 表；")
     L.append("3. 把确认后的新偏移 + 新 cmp 写回 `sysmod/src/fs_codepage.cpp`，"
              "跑 `make`（构建期守卫会逐点复验）；")
     L.append("4. 上机前用 `[options] fs_codepage=0` 保底（条目已无 stage 分级，"
@@ -1585,7 +1584,7 @@ def cmd_holes(args):
     """重推函数替换点的「洞」（可用空间）。
 
     洞表来自 Ghidra 的函数边界，换固件必须重推，否则构建守卫
-    (sysmod/tools/check_patch_sizes.py) 的 FUNCTIONS 表就是错的。
+    (scripts/check_patch_sizes.py) 的 FUNCTIONS 表就是错的。
     做法：先用锚点在新镜像里定位洞的**边界地址**（相邻函数入口），
     新洞 = 新边界 − 新补丁点；再读 fs-codepage.elf 的符号尺寸算余量。
     """
@@ -1861,10 +1860,9 @@ def write_batch_summary(out_root, rows, titles, main_cpp, args):
 
 
 def main():
-    # 公共参数**只注册在子 parser 上**。曾把 common 同时挂到主 parser，以为
-    # `--work x batch .` 与 `batch . --work x` 都能用——实测前者会被子 parser 的
-    # 同名默认值静默覆盖（argparse 会把 subnamespace 的**全部**属性 setattr 回来，
-    # 包括 default），结果是 --work 丢失、产物跑到 audit_out\ 且不报错。
+    # 公共参数**只注册在子 parser 上**。挂到主 parser 上会让
+    # `--work x batch .` 里的 --work 丢失且不报错：argparse 会把 subnamespace 的**全部**
+    # 属性 setattr 回主 parser（包括 default），子 parser 的默认值把用户给的值静默盖掉。
     # 现在主 parser 不认这些参数，写错位置会直接报 unrecognized arguments。
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--work", help="工作目录（解包产物与报告都放这里）")

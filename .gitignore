@@ -13,6 +13,10 @@ out/
 *.zip
 _build*.log
 
+# 内部工作文档（过程性分析、评审、决策台账）—— 只对本机有意义，不进仓库
+doc/inner/
+
 # 其它
 __pycache__/
 .vscode/settings.json
+.workbuddy

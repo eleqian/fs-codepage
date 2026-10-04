@@ -1,23 +1,22 @@
-#ifndef SYS_PATCH_FS_CODEPAGE_H
-#define SYS_PATCH_FS_CODEPAGE_H
+#ifndef FS_CODEPAGE_H
+#define FS_CODEPAGE_H
 
-// fs codepage patch (CP932 -> UTF-8). Implementation: fs_codepage.cpp.
+// fs codepage 补丁（CP932 -> UTF-8）。实现在 fs_codepage.cpp。
 //
-// No partial switch: the table is applied as a whole or skipped as a whole via
-// [options] fs_codepage=0 (a half applied table hangs FAT_MakeShortName).
+// 没有「部分生效」：补丁表要么整份应用、要么经 [options] fs_codepage=0 整份跳过
+// （半份会让 FAT_MakeShortName 挂死）。
 
-// Attach to fs, locate every patch point by pattern and apply it. Only the first
-// Rx/CodeStatic segment >= 1MiB is scanned (fs .text, which is also the module
-// base). fs is suspended while this runs, so the caller must not touch anything
-// that goes through the fs service (writing the SD log, for instance).
+// 附加 fs，按 pattern 定位全部补丁点并应用。
+// 只扫描第一个 >= 1MiB 的 Rx/CodeStatic 段（fs 主 .text，同时就是模块基址）。
+// 运行期间 fs 被挂起，调用方不得碰任何经过 fs 服务的操作（例如写 SD 卡日志）。
 void fs_codepage_patch(void);
 
-// Write the results to log.ini ([fs_codepage] / [fs_codepage_sites] / [debug]).
-// Only call this after fs_codepage_patch() has returned, i.e. fs is detached.
+// 把结果写进 log.ini（[fs_codepage] / [fs_codepage_sites] / [debug]）。
+// 只能在 fs_codepage_patch() 返回之后调用，即 fs 已脱附。
 void fs_codepage_write_log(const char* log_path);
 
-// Progress name of the last function group entered ("start" / <group> / "success").
-// If the patch ever hangs fs, this is the group that did it.
+// 最后进入的函数组的进度名（"start" / <组名> / "success"）。
+// 若补丁把 fs 打挂，这就是元凶所在的那一组。
 extern const char* fs_codepage_patch_result;
 
-#endif // SYS_PATCH_FS_CODEPAGE_H
+#endif // FS_CODEPAGE_H

@@ -1,80 +1,89 @@
 # AGENTS.md
 
-独立 Atmosphère 系统模块：开机一次，把 fs 进程里的 CP932(Shift-JIS) 代码页转换例程替换为
-UTF-8 <-> UTF-16，让 FAT/exFAT 卷支持中文等 3 字节 UTF-8 文件名。C++23 on devkitPro/libnx，aarch64。
-
-与 `impeeza/sys-patch` **无源码依赖**：本工程是它的姊妹模块，补丁站点与 upstream 的 fs 条目
-（noacidsigchk/noncasigchk/nocntchk）函数级不相交，可并存安装。
+fs-codepage：开机一次，把 fs 进程的 CP932 代码页转换换成 UTF-8 ⇄ UTF-16，让 FAT/exFAT 支持中文名。
+C++23 / devkitPro + libnx，aarch64。基于 sys-patch 框架，与 upstream sys-patch 可并存（站点函数级不相交）。
 
 ## Layout
 
-- `sysmod/` — 系统模块（title `42000000000000E0`）。
-  - `src/main.cpp` —— 本工程骨架：配置、调度（fs 调试器互斥 ⇒ 退避重试）、日志。
-  - `src/fs_codepage.cpp` —— 补丁本体（表 + 7 个替换体），API `src/fs_codepage.h`，
-    共享 pattern/patch 基元 `src/patch_types.h`。
-  - `tools/check_patch_sizes.py` —— 构建期守卫。
-  - `fs-codepage.json`（NPDM）/ `toolbox.json` / `Makefile`（`TARGET=fs-codepage`、`TITLE_ID`）。
-- `common/minIni/` — INI 库（与 sys-patch 同源）。
-- `doc/` — 设计文档 / 逆向结论（**不参与构建**），索引 `doc/README.md`。
-- `scripts/` — 离线工具（固件审计、反汇编、重名检查），**不参与构建**，需时手动跑。
-- `.workbuddy/memory/` — 逐日工作日志 + `MEMORY.md`（长期备忘，先读它）。
-- 运行时配置 `/config/fs-codepage/config.ini`，日志 `/config/fs-codepage/log.ini`。
+- `sysmod/src/main.cpp` —— 骨架：配置、调度（fs 调试器互斥 ⇒ 退避重试）、日志
+- `sysmod/src/fs_codepage.cpp` —— 补丁本体（表 + 整函数替换体）；API `fs_codepage.h`；基元 `patch_types.h`
+- `sysmod/{fs-codepage.json,toolbox.json,Makefile}` —— NPDM / Toolbox / `TARGET` 与 `TITLE_ID`
+- `common/minIni/` —— INI 库
+- `doc/` —— 对外文档与逆向结论（**不参与构建**），索引 `doc/README.md`；
+  `doc/inner/` 是内部工作文档，**已 gitignore**
+- `scripts/` —— 构建期守卫 `check_patch_sizes.py`（`make` 自动跑）+ 离线工具（手动跑）
+- `.workbuddy/memory/` —— 逐日日志 + `MEMORY.md`（长期备忘，先读它）
+- 运行期：配置 `/config/fs-codepage/config.ini`，日志 `/config/fs-codepage/log.ini`
 
 ## Build
 
-- 从**仓库根** `make`（只管 sysmod，产物收进 `out/`）；`make dist` 额外出 `fs-codepage-sysmodule.zip`。
-- 本机构建进 devkitPro 自带的 msys2 登录 shell：
+- 从**仓库根** `make`（只管 sysmod，产物收进 `out/`）；`make dist` 额外出 zip。
+  只跑守卫用 `make -C sysmod check-patch-sizes`（目标在 `sysmod/Makefile`，根 Makefile 没有）。
+- 本机：进 devkitPro 的 msys2 登录 shell 执行（它的 PATH 才带 `/opt/devkitpro/tools/bin`）：
   `C:\devkitPro\msys2\usr\bin\bash.exe -lc 'cd /d/Design/NS/fs-codepage && make' > _build.log 2>&1`
-  （它的 PATH 带 `/opt/devkitpro/tools/bin`；直连 IDE shell 取不到 stdout）。
-- 每次构建自动跑 `sysmod/tools/check_patch_sizes.py`（也 `make check-patch-sizes`）：校验 7 个 fs 替换体
-  （label delta == ELF 符号尺寸 且 ≤ 该点洞）、**从源码文本**解析 fs 补丁表、位置无关性。
-  **任一失败即构建失败**；正则解析不到的条目会被**静默跳过**，所以表条目必须保持原格式。
-- sysmod 需要 **`-fno-toplevel-reorder`**（在 `sysmod/Makefile`）：否则 GCC 把顶层 asm 排到延迟函数体之前，
-  算出的补丁尺寸为 0。
+- 守卫（每次构建自动跑，**任一失败即构建失败**）：替换体尺寸 ≤ 该补丁点的洞、位置无关、
+  并从**源码文本**解析补丁表。正则解析不到的条目会被**静默跳过** ⇒ 表条目必须保持原格式。
+- sysmod 需要 **`-fno-toplevel-reorder`**（在 `sysmod/Makefile`）：否则顶层 asm 被排到函数体之前，尺寸算成 0。
 
-## Hard invariants
+## Rules
 
-- **ASLR discipline.** 替换体被原样拷进 fs 地址空间、基址随机 ⇒ 必须位置无关且自包含：
-  不得出现绝对地址物化、外部调用、字面量池、`&function`。
-- **Never hardcode an fs offset or global.** 一切靠字节模式定位；随版本变化的值（代码页 ctx 槽、
-  一个外部 callee）由哨兵 `0xDEAD0001/2`、`0xDEAD0003/4` 在打补丁时从原函数体收割，
-  **收割失败该点整组放弃**（不写任何字节）。
-- **Pattern notation.** 只有一种写法：**`..` = 一个通配字节**（单个 `.` 非法），
-  依据是 `patch_types.h::str2hex`（看到 `.` 就 `s += 2`）。**表 / C++ / 离线脚本 / JSON
-  同一口径**，不要按「一个 `.` 一槽」写——那样槽数翻倍，通配符不在末尾的条目会全部 0 命中。
-- **Entry naming.** `fs_cp_<功能名>_<版本范围>`，版本范围 = **逐小版本实测端点**（x.y.z）：
-  `10.0.0-14.1.2` / `16.0.0+` / `10.0.0-14.1.2,21.0.0+`。支持下限 **10.0.0**（main.cpp 有
-  `MAKEHOSVERSION(10,0,0)` 门控；取不到版本则放行）、上限 = 语料最新 **22.5.0**。
-  ⚠️ **「同一大版本内 fs 不变」是错的**（12.0.x→12.1.0、16.0.2→16.0.3、
-  22.1.0→22.5.0 等都换驱动，补丁点恰在不变区）—— 不要再按 major 写范围。
-  族号 = 版本范围之前的功能前缀。**改名后必跑 `scripts/fs_version_matrix.py`**（范围 == 实测
-  命中 + 族内不相交 + 每份固件 14/14）。23.0.0 待新 master key。
-- **No per-entry gating.** 整份生效或整份跳过（`[options] fs_codepage=0`），没有中间态 ——
-  半成品的 fs 会挂（换了转换器却没打配对的宽度钳制 ⇒ `FAT_MakeShortName` 死循环）。
-- **Never hand-edit machine code** in the replacement bodies —— 只做语义等价改写，
-  并复验 7 个替换体尺寸逐位不变。
-- **四文件源自 sys-patch fork**（`fs_codepage.cpp/.h`、`patch_types.h`、`check_patch_sizes.py`），
-  拆分时逐字节复制。**2026-09-30 起本工程是权威侧**：改名（大版本范围）+ 12/13 覆盖
-  已改动 `fs_codepage.cpp` 与 `check_patch_sizes.py`，fork 侧停在旧版（其 `fs_codepage`
-  默认关闭，无影响）。需要时回拷（方向改为本工程 → fork）：
-  `cp sysmod/src/fs_codepage.cpp sysmod/tools/check_patch_sizes.py D:/Design/NS/sys-patch/sysmod/{src,tools}/`
-  fork 若有表更新仍需反向复制过来并跑守卫。
+改动前逐条对照：
+
+- **ASLR discipline.** 替换体被原样拷进 fs、基址随机 ⇒ 位置无关且自包含：无绝对地址物化、
+  无外部调用、无字面量池、不取函数地址。
+- **不写死任何 fs 偏移 / 全局.** 定位只靠字节模板；随版本变化的值在打补丁时从被覆盖的原函数体
+  **收割**（哨兵占位），**收割失败该点整组放弃**，一个字节都不写。ctx 槽判据是「候选集去重后
+  恰好 1 个」，歧义仍然拒绝 —— 不要退回「见到第 2 条 adrp 就放弃」，那会被无关的 adrp 误杀。
+- **收割成功 ≠ 指针可信.** 解错指针 ⇒ 替换体解引用野指针 ⇒ **fs 崩溃、只能 JIT 重新编译救砖**。
+  写内存前必须过 `fs_verify_ctx_chain()`：非 0、对齐、落在 fs 基址附近的**双向**窗口内
+  （单向会误杀），且该 impl 真正用到的槽同样成立；不通过 ⇒ `FAILED_HARVEST`。
+  ⚠️ 这一步**无法离线求值**（kip 文件里的 GOT 槽是压缩且未重定位的），上机后必须以 `log.ini`
+  里那 3 个收割点是 `Patched (sys-patch)` 而非 `Failed (fs ctx harvest)` 为准。
+- **整份生效或整份跳过**（`[options] fs_codepage=0`），**没有条目级开关** —— 半成品的 fs 会挂
+  （换了转换器却没打配对的宽度钳制 ⇒ `FAT_MakeShortName` 死循环）。
+- **不手改替换体机器码** —— 只做语义等价改写，并复验尺寸逐位不变。
+- **Pattern 只有一种写法：`..` = 一个通配字节**（单个 `.` 非法，依据 `patch_types.h::str2hex`）。
+  表 / C++ / 离线脚本 / JSON **同一口径**；按「一个 `.` 一槽」写会让槽数翻倍，
+  通配之后还有实字节的条目会全部 0 命中。
+- **模板末尾不留 `..`**：通配槽占位但不比值，只有后面还有实字节时才构成约束
+  （把后继实字节锚在正确的偏移上）；末尾通配恒真，唯一生效处是块尾越界判定
+  `i + plen >= data_size`，而那是负作用（只会漏命中）。
+  要消歧就补**实字节** —— 见 `fat_getnextpathcomp_10.0.0-14.1.2` 与
+  `widechar_compare_12.0.0-14.1.2` 的锚注释（只放宽不补锚会有 7~8 个命中点）。
+- **条目名 `fs_cp_<功能>_<版本范围>`**，版本范围 = **逐小版本实测端点**，**不按 major 写**
+  （同一大版本内 fs 也会换驱动，补丁点恰好落在不变区只是运气）。族 = 版本范围之前的功能前缀。
+- **改表 / 改名后必跑**（两个参数都不能省，默认值会给出**假的**改名建议 / 只验一个变体）：
+  `python scripts/fs_version_matrix.py --min 10.0.0 --variant both`
+  期望：**0 问题 + 每份固件全部族覆盖**。
+- **`RULE_PATCHES` 只留被条目引用的规则**：对应补丁点已被整函数替换的规则**别加回来**
+  （会改坏重写后的函数），守卫会报「未被任何条目引用的规则」。
+- **改表的连带清单**（漏一处即静默失效）：C++ 表 + `scripts/check_patch_sizes.py` +
+  `scripts/fs_fw_audit.py` —— 三处 pattern 解析口径必须同步。
+
+## Code comments
+
+**注释解释代码，不记录改动。** 来历是 `git log` / `blame` 的职责，写进注释只会腐烂。
+
+- 不写：日期、「（新增）」、「原来是 X 现已改成 Y」、「别把 X 加回来（已删过一次）」。
+  最后一条改写成**约束**（例：加改写规则前先确认该补丁点未被整函数替换覆盖）。
+- 要写：**为什么**（依据、坑位、原版怪癖、失败形态）、**不变量与前置条件**（歧义仍拒绝、
+  必须 8 字节对齐、callee 按去重目标数判）、**跨文件耦合**（改这里要同步哪个脚本）。
+- 自检：这条注释在描述「现在的代码」还是「代码的来历」？后者删掉。（`doc/` 是例外。）
+- **易变数字不进注释、不进文档**（条目数 / 族数 / 语料份数 / 函数组数）：由工具当场报出，
+  用 `static_assert` 守**不变式**而非当前值。**同一份数据只留一处**；需要人工比对的稳定值
+  （洞尺寸、偏移、返回值约定）只放 `doc/patch-design.md` §8。
 
 ## Docs
 
-文档与历史 **在本仓库**（2026-09-29 从 `D:/Design/NS/sys-patch` 的 `dev/fs-codepage` 分支迁来，
-原工程不再同步）。入口：
-
 | 要什么 | 读哪 |
 |---|---|
-| 功能/配置/构建/共存 | `README.md` |
+| 功能/安装/配置/排障 | `README.md` |
 | 文档索引（先读它定方向） | `doc/README.md` |
 | 方案与实现的唯一权威 | `doc/patch-design.md` |
 | 设计现状 + 决策台账 | `doc/design-decisions.md` |
-| 版本兼容选型 + 固件审计工具用法 | `doc/fw-compat.md` |
-| 离线工具 | `scripts/`（见 `doc/README.md` 末节） |
+| 内部工作文档（不进仓库） | `doc/inner/` |
+| 离线工具 + 构建期守卫 | `scripts/`（见 `doc/README.md` 末节） |
 | 硬约束速查 + 环境坑 | `.workbuddy/memory/MEMORY.md` |
 
-过程性历史（演进史全文、逐轮 Ghidra 笔记、事故复盘、退役脚本归档）已于 2026-09-29 删除，
-只保留最终设计思路与原理；原始过程见 git 历史提交 `eff8a96`，或 `D:/Design/NS/sys-patch`
-的 `dev/fs-codepage` 分支。
+过程性历史（演进史全文、逐轮 Ghidra 笔记、事故复盘、退役脚本归档）已删除或移入 `doc/inner/`；
+原始过程见 git 历史。

@@ -1,37 +1,37 @@
-#ifndef SYS_PATCH_PATCH_TYPES_H
-#define SYS_PATCH_PATCH_TYPES_H
+#ifndef PATCH_TYPES_H
+#define PATCH_TYPES_H
 
-// Pattern / patch primitives, shared by the system-title patcher (main.cpp) and
-// the fs codepage patch (fs_codepage.cpp).
+// Pattern / patch 基元，
+// 供系统模块补丁器（main.cpp）与 fs codepage 补丁（fs_codepage.cpp）共用。
 
 #include <cstring>
 #include <utility> // std::unreachable
 #include <switch.h>
 
-constexpr u16 REGEX_SKIP = 0x100;        // wildcard slot in a byte pattern
-constexpr u64 READ_BUFFER_SIZE = 0x1000; // size of static buffer which memory is read into
+constexpr u16 REGEX_SKIP = 0x100;        // 字节模板里的通配槽
+constexpr u64 READ_BUFFER_SIZE = 0x1000; // 读内存用的静态缓冲大小
 
-// "0xAB..CD" -> {0xAB, REGEX_SKIP, 0xCD}: ".." is one wildcard byte, two hex
-// chars are one literal byte. An invalid string is a compile-time error.
+// "0xAB..CD" -> {0xAB, REGEX_SKIP, 0xCD}：
+// ".." 是一个通配字节，两个 hex 字符是一个字面字节。非法字符串在编译期报错。
 template<typename T>
 constexpr void str2hex(const char* s, T* data, u8& size) {
-    // skip leading 0x (if any)
+    // 跳过前导 0x（若有）
     if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
         s += 2;
     }
 
-    // invalid string will cause a compile-time error due to no return
+    // 非法字符串会因无返回值而编译期报错
     constexpr auto hexstr_2_nibble = [](char c) -> u8 {
         if (c >= 'A' && c <= 'F') { return c - 'A' + 10; }
         if (c >= 'a' && c <= 'f') { return c - 'a' + 10; }
         if (c >= '0' && c <= '9') { return c - '0'; }
     };
 
-    // parse and convert string
+    // 解析并转换字符串
     while (*s != '\0') {
         if (sizeof(T) == sizeof(u16) && *s == '.') {
             data[size] = REGEX_SKIP;
-            s += 2; // consume both dots of ".."
+            s += 2; // 吃掉 ".." 的两个点
         } else {
             data[size] |= hexstr_2_nibble(*s++) << 4;
             data[size] |= hexstr_2_nibble(*s++) << 0;
@@ -45,7 +45,7 @@ struct PatternData {
         str2hex(s, data, size);
     }
 
-    u16 data[60]{}; // reasonable max pattern length, adjust as needed
+    u16 data[60]{}; // 模板长度上限（足够大，按需调整）
     u8 size{};
 };
 
@@ -66,7 +66,7 @@ struct PatchData {
         return !std::memcmp(data, _data, size);
     }
 
-    u8 data[20]{}; // reasonable max patch length, adjust as needed
+    u8 data[20]{}; // 补丁长度上限（足够大，按需调整）
     u8 size{};
 };
 
@@ -77,7 +77,7 @@ enum class PatchResult {
     PATCHED_FILE,
     PATCHED_SYSPATCH,
     FAILED_WRITE,
-    FAILED_HARVEST, // fs only: harvesting the site failed, the point is left untouched
+    FAILED_HARVEST, // 仅 fs：现场收割失败，该点保持原样不动
 };
 
 inline auto patch_result_to_str(PatchResult result) -> const char* {
@@ -94,4 +94,4 @@ inline auto patch_result_to_str(PatchResult result) -> const char* {
     std::unreachable();
 }
 
-#endif // SYS_PATCH_PATCH_TYPES_H
+#endif // PATCH_TYPES_H

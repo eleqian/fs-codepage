@@ -2,22 +2,30 @@
 """
 fs_version_matrix.py —— 补丁点 × 固件版本 的真实命中矩阵 + 命名建议。
 
-为什么需要它（2026-09-30）：
-  之前按「同一大版本内 fs 驱动字节级不变」把条目名写成 major 粒度（`12` / `12-15` /
-  `16+`）。**该假设被语料证伪**：18.0.x→18.1.0、20.0.x→20.1.x、21.1.0→21.2.0、
-  22.1.0→22.5.0 的 fs 二进制都不同（上游 sys-patch 的 es 断点也落在 21.2.0 这种
-  非大版本边界上）。所以范围必须回到 `a.b.c` 粒度，并且**逐版本实测**。
+为什么需要它：条目名的版本范围**不能按大版本写**。「同一大版本内 fs 驱动字节级不变」
+这个假设已被语料证伪：18.0.x→18.1.0、20.0.x→20.1.x、21.1.0→21.2.0、22.1.0→22.5.0
+的 fs 二进制都不同。
+所以范围必须回到 `a.b.c` 粒度，并且**逐版本实测**。
 
 本工具做的事：
   1. 把语料按 FS 二进制哈希分组 ⇒ 看清哪些版本共用一份 fs（范围可跨版本外推的根据）
   2. 逐条条目 × 逐份固件数命中数：1 = 唯一命中、0 = 未命中、>1 = 落点不唯一（错误）
   3. 由实测结果生成**建议名字**（把连续命中的版本段压成 `a.b.c-d.e.f` / `a.b.c+`）
-  4. 族内互斥检查 + 每份固件的族覆盖（14/14）
+  4. 族内互斥检查 + 每份固件的族覆盖（全部族都命中）
 
 用法：
-  python scripts/fs_version_matrix.py                     # 全语料
-  python scripts/fs_version_matrix.py --variant 081b      # 只看 exfat 变体
-  python scripts/fs_version_matrix.py --min 12.0.0 --suggest
+  python scripts/fs_version_matrix.py                          # 全语料（标准动作）
+  python scripts/fs_version_matrix.py --min 10.0.0 --variant both
+  python scripts/fs_version_matrix.py --suggest
+
+★ 改条目名 / 版本范围后的**标准动作**是
+      fs_version_matrix.py --min 10.0.0 --variant both
+  两个参数都不能省：
+    --min 10.0.0  模块支持下限是 10.0.0（main.cpp 的 MAKEHOSVERSION(10,0,0) 门控）。
+                  若沿用旧的 12.0.0，10.x/11.x 的命中会被当成「不在支持范围」，
+                  --suggest 于是对 10.x 条目给出**假的**改名建议 —— 照改会丢 10.x 支持。
+    --variant both  0819 / 081b 两个变体必须都验；只验一个变体等于把一半语料没看过。
+  期望：0 问题、每份固件全部族覆盖。条目数/族数由本脚本当场报出，不写死在文档里。
 """
 import argparse
 import collections
@@ -140,7 +148,9 @@ def main():
     ap.add_argument("--root", default=DEF_ROOT)
     ap.add_argument("--main", default=DEF_MAIN)
     ap.add_argument("--variant", default="081b", choices=["081b", "0819", "both"])
-    ap.add_argument("--min", default="12.0.0", help="支持下限；更老的只提示")
+    ap.add_argument("--min", default="10.0.0",
+                    help="支持下限（默认 = 模块实际下限 10.0.0；调高会把 10.x/11.x 的命中"
+                         "当成「不在支持范围」，--suggest 于是给出假的改名建议）")
     ap.add_argument("--suggest", action="store_true", help="输出建议改名表")
     args = ap.parse_args()
 
@@ -224,7 +234,12 @@ def main():
         if extra:
             errs.append("%s: 实测命中但名字未声明 %s" % (name, ",".join(extra)))
         if below:
-            print("        注：低于下限的命中 %s（不在支持范围）" % ",".join(below))
+            # 关键：低于 --min 的命中被排除出版本域后，collapse() 会把这条的实测集合
+            # 看成空的（或缺头），从而给出**假的**改名建议。必须显式提醒，
+            # 否则「照建议改名」会直接削掉 --min 以下的那段支持。
+            print("        注：低于下限 %s 的命中 %s 被排除出版本域 —— 本条的建议名不可信，"
+                  "请用 --min %s 重跑" %
+                  (args.min, ",".join(below), below[0]))
         if sug != ver:
             suggest.append((name, pt, ver, sug))
     print()
@@ -246,20 +261,29 @@ def main():
     print()
 
     # ---- 4. 每份固件的族覆盖 -------------------------------------------------
-    print("=== 每份固件（≥ %s）的族覆盖 ===" % args.min)
+    print("=== 每份固件（≥ %s，变体 %s）的族覆盖 ===" % (args.min, args.variant))
     nfam = len(fams)
     bad = 0
+    checked = 0
+    checked_v = set()
     for v, var, p in files:
         if v < lo or (args.variant != "both" and var != args.variant):
             continue
+        checked += 1
+        checked_v.add(v)
         got = {fam_of(n)[0] for _k, n, _p in ents if hits[n].get((v, var)) == 1}
         if len(got) != nfam:
             bad += 1
             print("  %-9s %-3s %2d/%d  缺 %s" %
                   (vstr(v), var, len(got), nfam,
                    ",".join(sorted(f for f in fams if f not in got))))
+    # 汇总行要区分「版本数」与「实际校验的固件份数」：以前只印版本数却写成「份固件」，
+    # 读起来比真正验证过的范围大（--variant 默认只验一个变体时尤其误导）。
+    print("  版本 %d 个 / 实际校验 %d 份固件%s" %
+          (len(checked_v), checked,
+           "" if bad == 0 else "，覆盖不全 %d 份" % bad))
     if bad == 0:
-        print("  全部 %d 份固件 %d/%d 覆盖" % (len(allv), nfam, nfam))
+        print("  全部 %d 份固件 %d/%d 覆盖" % (checked, nfam, nfam))
     print()
 
     # ---- 5. 建议改名 ---------------------------------------------------------

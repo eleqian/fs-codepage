@@ -11,8 +11,8 @@ include $(DEVKITPRO)/libnx/switch_rules
 
 #---------------------------------------------------------------------------------
 # fs-codepage -- standalone fs codepage (UTF-8) patch module.
-# Extracted from the sys-patch fork; builds by itself so it can coexist with
-# the ORIGINAL upstream sys-patch (title id 420000000000000B).
+# Built on the sys-patch framework; builds by itself and can coexist with the
+# original upstream sys-patch (different title id).
 #---------------------------------------------------------------------------------
 TARGET		:=	fs-codepage
 BUILD		:=	build
@@ -154,14 +154,14 @@ dist: all
 #---------------------------------------------------------------------------------
 # build-time guard: verify every fs codepage patch function's runtime size
 # (end-label delta) equals its ELF symbol size and fits the hole at its patch
-# site in the fs binary. Same guard as the sys-patch build; kept in sync with
-# tools/check_patch_sizes.py.
+# site in the fs binary. The guard script lives outside the module tree
+# (../scripts/check_patch_sizes.py) — it is a build tool, not module code.
 #---------------------------------------------------------------------------------
 
 .PHONY: check-patch-sizes
 check-patch-sizes:
 ifdef PATCHCHECK_PY
-	@$(PATCHCHECK_PY) tools/check_patch_sizes.py $(CURDIR)/$(TARGET).elf --main $(CURDIR)/src/fs_codepage.cpp
+	@$(PATCHCHECK_PY) $(CURDIR)/../scripts/check_patch_sizes.py $(CURDIR)/$(TARGET).elf --main $(CURDIR)/src/fs_codepage.cpp
 else
 	@echo "warning: python not found, skipping patch size check"
 endif

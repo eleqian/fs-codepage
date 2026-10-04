@@ -68,13 +68,13 @@ typedef enum {
     ENCODE_UNICODE = 2,
 } StringEncode_e;
 
-/* nne::prfile2::StringDesc */
+/* nne::prfile2::FsString */
 typedef struct {
     char          *ptr_left;               /* 0x00 */
     char          *ptr_right;              /* 0x08 */
     StringEncode_e encode_type;            /* 0x10 */
     u32            rsvd;                   /* 0x14 */
-} StringDesc;                              /* 0x18 */
+} FsString;                              /* 0x18 */
 
 /* ------------------------------------------------------------------------- */
 /* FAT / exFAT on-disk + parsed structures                                    */

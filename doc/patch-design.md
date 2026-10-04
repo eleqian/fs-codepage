@@ -1,7 +1,7 @@
 # UTF-8 中文路径补丁 —— 方案与实现（定稿）
 
-> 状态（2026-09-20）：系统正常启动 ✓；文件管理器**能看到中文名** ✓；**能打开并读取**中文路径 ✓；
-> 构建期守卫全绿 ✓；离线验证全绿（26/26 端到端、扫描优化新旧等价、M6 对**原版 0 补丁**的可执行差分）✓。
+> 状态（2026-09-20 上机验证）：系统正常启动 ✓；文件管理器**能看到中文名** ✓；**能打开并读取**中文路径 ✓；
+> 构建期守卫全绿 ✓；离线验证全绿（端到端、扫描优化新旧等价、M6 对**原版 0 补丁**的可执行差分）✓。
 > 目标固件：`19.exfat.FS.kip1`（Ghidra 分析基址 0x7100000000，**运行时地址随机化，该基址仅用于分析**）。
 >
 > **本文只描述当前（最终）形态。** 实现是**全 pattern 驱动、运行时零硬编码 fs 偏移**：定位靠字节
@@ -9,11 +9,15 @@
 > - §1–§7 里按原版二进制标定的 fs 偏移（如 `0xf5840`、页 `0xf5000`）**只是“逻辑清单”**，
 >   用于解释“改什么、为什么”，运行时**不依赖**它们；§3.3/§4/§8 里任何“固定在页 X / 槽 +Y”的
 >   静态假设一律作废 —— fs 全局槽与外部 callee 全部**现场收割**（失败整点跳过）。
-> - 七个整函数替换（§3.5 / §3.6 与 §2.1）已取代原先的逐指令写法。
+> - 大部分补丁点已由整函数替换（§3.5 / §3.6 与 §2.1）取代原先的逐指令写法。
 > - 扫描侧有三项由数据推导的优化（族内互斥兄弟退役 / 全族落定空转退出 / blob 车道快筛），
->   等价性由 `_audit/_opt_equiv.py` 在 26 份固件上逐条验证。
-> - 过程中被推翻的结论已随过程文档删除（2026-09-29 整理）；
->   设计现状与决策台账见 `../design-decisions.md`。
+>   等价性由 `_audit/_opt_equiv.py` 在全语料上逐条验证。
+> - 过程中被推翻的结论已随过程文档删除或移入 `doc/inner/`；
+>   设计现状与决策台账见 `design-decisions.md`。
+>
+> 条目数、族数、语料份数等**易变数字不进正文** —— 现值一律由
+> `scripts/fs_version_matrix.py` 与构建期守卫当场报出；真正需要人工比对的速查值
+> （尺寸 / 洞 / 偏移）集中在 §8。
 
 ---
 
@@ -23,7 +27,7 @@
 
 ```
 应用（UTF-16）
-   │  Unicode → OEM（per-char PFCODE_CP932_Unicode2OEM / 字符串级 PFCODE_Str_Unicode2OEM）
+   │  Unicode → OEM（per-char PFCODE_CP932_Unicode2OEM / 字符串级 StrUnicode2OEM）
    ▼
 fs 内部：OEM 字节串（FAT 侧按 CP932 假设逐字节/双字节步进、比较、拼名字）
    │  OEM → Unicode（per-char PFCODE_CP932_OEM2Unicode / 字符串级 Str_OEM2Unicode）
@@ -47,7 +51,7 @@ fs 内部：OEM 字节串（FAT 侧按 CP932 假设逐字节/双字节步进、�
 
 ---
 
-## 2. 补丁清单（逻辑 16 处 / 29 个补丁点；当前落为 **15 条指令条目 + 17 条整函数替换 = 32 条**，覆盖 **12.0.0–22.5.0 全部 45 个小版本语料**）
+## 2. 补丁清单（逻辑 16 处 / 29 个补丁点）
 
 > 下表是**逻辑清单**（按 19.exfat 标定的原版偏移，用来解释改动的语义）。
 > 运行期不依赖这些偏移：条目按字节模板定位（`fs_codepage.cpp` 的两级表 `fs_fn_groups[]`
@@ -55,21 +59,22 @@ fs 内部：OEM 字节串（FAT 侧按 CP932 假设逐字节/双字节步进、�
 > `FAT_MatchWildcardRecursive` 与 `FAT_GetNextChar` 的逐点改写现已由**整函数替换**取代。
 >
 > **条目数 ≠ 补丁点数**：整函数替换把该函数内的所有点折叠成 1 条；而**跨代变体族**
-> （14.1.2/15.0.1 属另一代代码生成：寄存器重分配 + 局部重排）需要各自追加条目。
-> 综上：14 个补丁点 → 32 条条目，每份固件实际落地 14 条。
+> （14.1.2/15.0.1 属另一代代码生成：寄存器重分配 + 局部重排；10.x/11.x 又是一代）
+> 需要各自追加条目。
+> 每份固件实际落地的条目数 = 补丁点数（其余是同点的互斥变体）。
 >
-> **条目命名（2026-09-20 起；2026-09-30 晚改回精确 x.y.z 粒度）**：`fs_cp_<功能名>_<版本范围>`。
+> **条目命名**：`fs_cp_<功能名>_<版本范围>`。
 > 版本范围 = **语料实测覆盖**，按小版本端点写：闭区间 `12.0.0-15.0.1`、开区间 `16.0.0+`、
 > 多段 `12.0.0-14.1.2,21.0.0+`。
-> 演进：先按 sys-patch 的 `a.b.c-d.e.f` 写 → 一度改按大版本（当时假设「同一大版本内 fs
+> 演进：一度改按大版本（当时假设「同一大版本内 fs
 > 驱动字节级不变」）→ **该假设被全语料哈希对比证伪**（12.0.x→12.1.0、13.0.0→13.1.0、
-> 16.0.2→16.0.3、18.0.x→18.1.0、21.1.0→21.2.0、22.1.0→22.5.0 的 fs 都有新代；上游
-> sys-patch 的 es 断点也落在 21.2.0 这种非大版本边界）→ 补齐 12.0.0–22.5.0 全部小版本
-> 语料后**逐小版本实测**，范围回到精确粒度。major 写法在守卫 `NAME_RE` 里仍兼容但不再使用。
+> 16.0.2→16.0.3、18.0.x→18.1.0、21.1.0→21.2.0、22.1.0→22.5.0 的 fs 都有新代）→
+> 补齐 10.0.0–22.5.0 全部小版本语料后**逐小版本实测**，范围回到精确粒度。
+> major 写法在守卫 `NAME_RE` 里仍兼容但不再使用。
 > **族号 = 版本范围之前的功能前缀**（不再有 `pNN` 编号）；范围由 `scripts/fs_version_matrix.py`
-> 锁死（32 条 / 14 族 / 0 问题，语料 46 份 / 45 个小版本）。**不加**条目级固件版本字段 ——
-> 运行期仍是「pattern 命中 + 族内互斥兄弟退役」，名字里的范围只作可读标注。
-> 格式的机器可读性由构建守卫 `check_patch_sizes.py` 的 `NAME_RE` 兜底。
+> 锁死（**标准动作 `--min 10.0.0 --variant both`**：0 问题、每份固件全部族覆盖）。
+> **不加**条目级固件版本字段 —— 运行期仍是「pattern 命中 + 族内互斥兄弟退役」，
+> 名字里的范围只作可读标注。格式的机器可读性由构建守卫 `check_patch_sizes.py` 的 `NAME_RE` 兜底。
 
 ### 2.1 函数级替换（整函数写入，**7** 处）
 
@@ -78,8 +83,8 @@ fs 内部：OEM 字节串（FAT 侧按 CP932 假设逐字节/双字节步进、�
 | `0xfeac0` | `PFCODE_CP932_OEM2Unicode` | `patch_utf8_to_utf16` | 0xEC / 0x170 | UTF-8 → UTF-16，逐字节续字节校验 |
 | `0xfec30` | `PFCODE_CP932_Unicode2OEM` | `patch_utf16_to_utf8` | 0x8C / 0x1D0 | UTF-16 → UTF-8；**返回值约定**：高 16 位=输出字节数、低 16 位=输入字节数（与原版 `0xf7cf0` 宽度 helper 逐位一致）；**三条分支都写满 `[0..2]`**，1/2 字节分支的 NUL 分别落在 `[1]`/`[2]` —— 1 字节分支的 NUL 必须在 `[1]`（原版 `strb wzr,[x1,#1]`），只写 `[2]` 会把紧随的 `[1]` 留给旧字节 |
 | `0xfee40` | `PFCODE_CP932_isOEMMBchar` | `patch_is_oem_mb_char` | 0x48 / 0x50（余量 8 B） | 见 §3.2（按 idx 双语义） |
-| `0xf5840` | `PFCODE_Str_Unicode2OEM` | `patch_str_unicode2oem` | 0xEC / 0x120 | 字符串级转换 + **512 字节输出上限**（修 `lname[513]` 溢出；见 §3.3），内联 UTF-16→UTF-8 |
-| `0xf7c10` | `StringDesc_ToUpper` | `patch_stringdesc_toupper` | 0x94 / 0xB0 | OEM 分支改 ASCII-only 大写（原版对 signed char 调 toupper 属未定义行为） |
+| `0xf5840` | `StrUnicode2OEM` | `patch_str_utf16_to_utf8` | 0xEC / **0x110** | 字符串级转换 + **512 字节输出上限**（修 `lname[513]` 溢出；见 §3.3），内联 UTF-16→UTF-8 |
+| `0xf7c10` | `FsString_ToUpper` | `patch_fsstring_toupper` | 0x94 / 0xB0 | OEM 分支改 ASCII-only 大写（原版对 signed char 调 toupper 属未定义行为） |
 | `0xf4770` | `FAT_MatchWildcardRecursive` | `patch_widechar_compare` | 0x308 / 0x360（余 88 B） | **M6**：折叠该函数全部 15 个指令点为一次整函数替换；编码域感知的 `*`/`?` 通配符匹配 + 递归回溯。见 §3.5 |
 | `0xf44e0` | `FAT_GetNextChar` | `patch_fat_getnextchar` | 0x1E8 / 0x240（余 88 B） | **M8**：折叠该函数里步进/读宽/写宽 + 24 位值构造（原 4 个相邻指令点）为一次整函数替换；入口 24 B 前缀无通配。见 §3.6 |
 
@@ -93,10 +98,10 @@ fs 内部：OEM 字节串（FAT 侧按 CP932 假设逐字节/双字节步进、�
 | `0xd4af4` | `IDirectory_Read` 内 | `b.cc` → `nop` | 不再丢弃含高位字节的名字 |
 | `0xf45d8` | `FAT_GetNextChar` 内 | `add x9,x8,#1` → `add x9,x8,x0`；`ldrb`→`ldrh`；`strb`→`sturh` | 步进改用 isOEMMBchar 返回值（额外字节数；外层循环另有 +1 ⇒ 总长） |
 | `0xf4d8c` | `FAT_GetNextPathComponent` 内 | `add x9,x8,#1` → `add x9,x8,x0` | 同上（路径分量切分） |
-| `0xf77e8` | `StringDesc_AddLeft` 内 | `cinc w8,w22,ne` → `add w8,w22,w0` | 字符数按"额外字节"累加 |
-| `0xf7984` | `StringDesc_GetCharCount` 内 | `cinc x19,x19,ne` → `add x19,x19,x0` | 同上 |
-| `0xf7a80` | `StringDesc_CompareUnicode` 内 | `csel x8,x19,x22,eq` → `add x8,x19,x0` | 同上 |
-| `0xf7bd0` | `StringDesc_CompareOem` 内 | `csel x20,x20,x23,eq` → `add x20,x20,x0` | 同上 |
+| `0xf77e8` | `FsString_AddLeft` 内 | `cinc w8,w22,ne` → `add w8,w22,w0` | 字符数按"额外字节"累加 |
+| `0xf7984` | `FsString_GetCharCount` 内 | `cinc x19,x19,ne` → `add x19,x19,x0` | 同上 |
+| `0xf7a80` | `FsString_CompareUnicode` 内 | `csel x8,x19,x22,eq` → `add x8,x19,x0` | 同上 |
+| `0xf7bd0` | `FsString_CompareOem` 内 | `csel x20,x20,x23,eq` → `add x20,x20,x0` | 同上 |
 | `0xf4888` | `FAT_MatchWildcardRecursive` #1 | `add w10,w9,#1` → `add w10,w9,w0` | w9 已是 idx+1 ⇒ idx+1+额外 = **idx+总长** |
 | `0xf49c4` | `FAT_MatchWildcardRecursive` #2 | `add w8,w25,#2` → **`add w8,w27,w0`** | 该点基址是 idx 本身，单指令做不出 `idx+w0+1`；**x27 在 0xf49a4 已算好 idx+1 且 callee-saved** ⇒ 改用它作基址 |
 | `0xf4a90` | `FAT_MatchWildcardRecursive` #3 | `add w10,w9,#1` → `add w10,w9,w0` | 同 #1 |
@@ -105,19 +110,18 @@ fs 内部：OEM 字节串（FAT 侧按 CP932 假设逐字节/双字节步进、�
 > FAT32（非 exFAT）路径的整块补丁（当年那个 `mem_info.addr + 0xced30` 的注释稿）已删除：
 > 现在两条路径都由同一套 pattern 覆盖，不再需要按文件名长度分流的手工补丁。
 >
-> **★ 折叠情况**：上表 11 行里，`0xf45d8`（`FAT_GetNextChar`）已并入 §2.1 的 M8 整函数替换，
-> `0xf4888` / `0xf49c4` / `0xf4a90`（`FAT_MatchWildcardRecursive` #1–#3）已并入 M6，
-> 这 4 行不再有独立条目；其余 7 行各对应一个指令改写补丁点（IDirectory_Read、
-> FAT_GetNextPathComponent、StringDesc_AddLeft / GetCharCount / CompareUnicode / CompareOem、
-> FAT_MakeShortName），因跨版本变体族而展开为 15 条 pattern 条目。
+> **★ 折叠情况**：上表里 `FAT_GetNextChar` 的逐点改写已并入 §2.1 的 M8 整函数替换，
+> `FAT_MatchWildcardRecursive` 的 3 处已并入 M6，它们不再有独立条目；其余各行对应一个
+> 指令改写补丁点（IDirectory_Read、FAT_GetNextPathComponent、FsString_AddLeft / GetCharCount /
+> CompareUnicode / CompareOem、FAT_MakeShortName），因跨版本变体族而展开为多条 pattern 条目。
 
 ---
 
-## 3. 七个替换函数的实现要点
+## 3. 整函数替换的实现要点
 
-> **共享对象视图 `StringDesc`**（2026-09-20）：`StringDesc`、字符迭代器、模式流三种 fs 对象的
+> **共享对象视图 `FsString`**：`FsString`、字符迭代器、模式流三种 fs 对象的
 > **内存布局完全相同**（`+0x00`/`+0x08` 各 8 字节字段，`+0x10` 一个 8 字节槽），原先分别声明为
-> `FsStrDescLite` / `FsCharIter` / `FsPatStream24`。现统一成**单一 24 B 结构 `StringDesc`**
+> `FsStrDescLite` / `FsCharIter` / `FsPatStream24`。现统一成**单一 24 B 结构 `FsString`**
 > `{void *ptr_left; void *ptr_right; u32 encode_type; u32 reserved;}`，按 fs 原型命名，**不用 union**。
 > 三处 `+0x10` 本就是同一个「编码/宽度」选择子（`==1` 单字节 / `ENCODE_OEM`），无需别名；
 > 显式写出 `+0x14` 保留字段使结构体恰为 24 B、**无尾部填充**（整对象拷贝 `*ps` 的字节数确定）。
@@ -136,10 +140,25 @@ fs 内部：OEM 字节串（FAT 侧按 CP932 假设逐字节/双字节步进、�
 adrp x3, <page>        ; 相对"本指令所在页"
 ldr  x3, [x3, #<off>]  ; → 代码页上下文指针
 ```
-  **具体页/偏移不是常量**：26 份固件里该槽有 18 个不同取值。替换体用哨兵对
-  `0xDEAD0001/2` 占位，运行时由 `fs_harvest_ctx_slot()` 从**原函数**里解出唯一的
-  `adrp + 配对 ldr`，再按哨兵的真实地址重编码（失败整点跳过）。M6 另有外部 callee 用
-  `0xDEAD0003/4` 占位（`fs_harvest_callee()`）。
+  **具体页/偏移不是常量**：全语料里该槽有 18 个不同取值。替换体用哨兵对
+  `0xDEAD0001/2` 占位，运行时由 `fs_harvest_ctx_slot()` 从**原函数**里解出 ctx 槽
+  （枚举窗口内所有 `adrp + 配对 ldr` 组合，只收「槽落在函数体之后、距代码 ≤ 4 MB」的，
+  **候选去重后恰好 1 个**才收 —— 早期版本是「见到第 2 条 `adrp` 就放弃」，会被与 ctx 无关的
+  `adrp` 误杀），再按哨兵的真实地址重编码。M6 另有外部 callee 用 `0xDEAD0003/4` 占位
+  （`fs_harvest_callee()`）。**失败一律整点跳过、原函数不动。**
+
+  **收割 ≠ 指针可信（2026-10-03 加固）**：收割成功也可能解出错的指针，后果是替换体
+  解引用野指针 → **fs 崩溃、只能 JIT 重新编译救砖**。所以写内存之前还有一道
+  `fs_verify_ctx_chain()`：把 `slot` 处的指针读回来，要求非 0、8 字节对齐、落在
+  `fs_code_base ± 64 MB`（双向窗口：fs 的 KIP 段在 `.text` 之前还是之后不保证，单向会误杀），
+  再按 impl 校验它真正读到的槽（`FAT_GetNextChar` 验 `+0x18/+0x20/+0x30`、
+  `WideChar_Compare` 验 `+0x30`；`StrUnicode2OEM` 只读标志位故不验）非 0、4 字节对齐、同窗口内。
+  不通过 ⇒ `FAILED_HARVEST`，一个字都不写。
+  ⚠️ 这一步**无法离线求值**：GOT 槽与 ctx 表在 kip 文件里是压缩/未重定位的
+  （按文件偏移读 19.exfat 的槽得到 `0x0024CE0800000000`，不是指针），只有目标进程里
+  重定位后的内存是真值 ⇒ 上机后必须看 `log.ini` 里这 3 个点是 `Patched (sys-patch)`
+  而不是 `Failed (fs ctx harvest)`。守卫侧只能复算「候选集唯一」（纯指令分析）
+  外加钉住判据本身（`check_ctx_verify_spec()`）。
 
 ### 3.2 `patch_is_oem_mb_char`：**必须按 `byte_idx` 区分两种语义**
 
@@ -167,7 +186,7 @@ ldr  x3, [x3, #<off>]  ; → 代码页上下文指针
 同一个**无符号**比较 `(unsigned)extra < 4 ? extra : 0` ⇒ 再省 8 字节（`cmp`/`b.ls` 一对），
 0x48 / 0x50 的 8 字节余量就是这么来的（此前顶格 0x50）。
 
-### 3.3 H1（`patch_str_unicode2oem`）完全自包含
+### 3.3 H1（`patch_str_utf16_to_utf8`）完全自包含
 
 - 普通模式：**内联** UTF-16→UTF-8（等价于 `patch_utf16_to_utf8`），不再调用 `ctx+0x20` 回调；
 - 特殊映射模式（MakeShortName 生成 8.3 占位名）：**直接比较 u16**（`'.'`/`' '`/其余→`'_'`），
@@ -178,9 +197,9 @@ ldr  x3, [x3, #<off>]  ; → 代码页上下文指针
   只判 `out < limit` 是不够的：逐字节写入会让 `out` 越过 `limit` 1~2 字节、NUL 再越 1。
   `>`170 个 CJK 字符的长名会被截断（可接受权衡）。
 
-### 3.4 R4（`patch_stringdesc_toupper`）
+### 3.4 R4（`patch_fsstring_toupper`）
 
-- `StringDesc` 布局：`ptr_left@0x00`、`ptr_right@0x08`、`encode_type@0x10`（`ENCODE_OEM=1`）；
+- `FsString` 布局：`ptr_left@0x00`、`ptr_right@0x08`、`encode_type@0x10`（`ENCODE_OEM=1`）；
 - OEM 分支只对 `'a'–'z'` 大写，≥0x80 原样保留；Unicode 分支与逐字符大写；
 - 两分支都受 `maxLen` 限制并以 NUL 收尾，非 OEM 分支写 u16（与原版两字节/字符一致）。
 
@@ -190,10 +209,10 @@ ldr  x3, [x3, #<off>]  ; → 代码页上下文指针
   去 `cmp … uxth`、R1 的三处步进、R1b 的三处访宽）全部由一份实现取代 —— 该函数**只剩整函数替换一条路径**。
 - **入参口径**：`M6(name0 /*x1*/, nd /*x2*/, pat0 /*x3*/, ps /*x4*/)`，
   其中 `name0` 是 `FsNameDesc16 {u64 data; u16 enc; u16 pos; u32 pad}`，
-  `ps` 是 `StringDesc`（`ptr_left=cur@0x00; ptr_right=end@0x08; encode_type@0x10`，
+  `ps` 是 `FsString`（`ptr_left=cur@0x00; ptr_right=end@0x08; encode_type@0x10`，
   `encode_type` 即模式流的 `mode` 低 32 位 = 宽度，1→1 字节读，否则 2 字节）——
-  同一 24 B 布局被 `StringDesc` / 字符迭代器 / 模式流三个视图共用，见 `fs_codepage.cpp`
-  的 `StringDesc` 定义与 `static_assert`。
+  同一 24 B 布局被 `FsString` / 字符迭代器 / 模式流三个视图共用，见 `fs_codepage.cpp`
+  的 `FsString` 定义与 `static_assert`。
   比较口径 `value = (b0<<16) | (b2<<8) | b1`（24 位）。
 - **ASCII 折叠**：原版用 `mov wT,#0xffe0; add`，32 位相加的进位靠随后 `uxth`（16 位）比较丢掉
   ⇒ 等价于 `sub #0x20`。本实现是 32 位比较，必须**显式写 `c-0x20`**（`fold_ascii_upper`）——
@@ -222,7 +241,7 @@ ldr  x3, [x3, #<off>]  ; → 代码页上下文指针
 
 ---
 
-## 4. 构建期守卫（`sysmod/tools/check_patch_sizes.py`，make 钩子自动运行）
+## 4. 构建期守卫（`scripts/check_patch_sizes.py`，make 钩子自动运行）
 
 `make` 时自动执行，任一失败即中断构建。三类校验：
 
@@ -242,13 +261,21 @@ ldr  x3, [x3, #<off>]  ; → 代码页上下文指针
    callee 的**去重外跳目标数 == 1**。
    P3 起再加三条护"从数据推导出来的结构"的检查：**族内互斥**（同补丁点在参考固件上 ≤1 条命中）、
    **族名合规**（`fs_cp_<功能名>_<版本范围>`）、**blob 车道筛子可用**（偏移 0 或 4 至少一个确定字节）。
+   **2026-10-03 再加两条**：
+   - **未被引用的改写规则告警**：`RULE_PATCHES` 里若有任何一条不被 `fs_inst_patches[]` 引用就报。
+     这条是给「死代码 + 活校验」兜底的 —— M6/M8 把 15 个逐指令补丁点折进整函数替换后，
+     那 9 条规则已无人引用，2026-10-03 连同 C++ 实现一起删除；留着它们会让「写新条目时
+     挑到一个看起来可用、守卫也放行、但会改坏已被整函数替换覆盖的函数」的规则成为可能。
+   - **ctx 链校验判据一致性**（`check_ctx_verify_spec()`）：从 C++ 源码解析 `FS_MODULE_SPAN`
+     与每个 impl 要验的槽集合，与 Python 侧的约定比对。ctx 链**求值**无法离线做
+     （数据段是压缩/未重定位的），但「验什么」两边必须一致，否则守卫验的不是运行期跑的那套。
    > 旧的"每条手写机器码必须解码成合法改写（`nop` / `movz` / `add Rd,Rn,w0` …）"那一项
    > **随字节数组表一起消失了**：pattern 驱动之后没有手写指令字，`patch(inst)` 只在运行时
    > 应用语义等价的 `rules_*` 改写，所以那类"把立即数编码当移位寄存器用"的错法不再可能。
 3. **ASLR 位置无关性**：扫描 **7** 个替换函数机器码，禁止 MOVZ/MOVK 宽常量（≥0x1000000）、
    `LDR` 字面量池、**外部 `BL`**、跳出函数的 `B`；`ADRP` **只允许「`adrp` + `add` 同寄存器」**
    这一种 PC 相对用法（自包含的模块内引用）。**P1 之后不再允许任何硬编码槽地址** ——
-   旧版"槽固定在页 0xf5000 / +0x159000"的断言已删除（实测该槽在 26 份里有 **18** 个不同取值）。
+   旧版"槽固定在页 0xf5000 / +0x159000"的断言已删除（实测该槽在全语料里有 **18** 个不同取值）。
    > P3 整理时连「允许 `adrp +0x159000 / ldr #0xb50` 直读该槽」的分支也一并删了 ——
    > 哨兵收割之后已没有任何替换体用这种编码，留着那条分支（以及"必须落在页 0xf5000"的
    > 伴随断言）只是死代码 + 误导。`scan_absolutes()` 的返回值也从 `(hits, slots)` 简化成 `hits`。
@@ -263,7 +290,7 @@ ldr  x3, [x3, #<off>]  ; → 代码页上下文指针
 
 ```ini
 [options]
-fs_codepage=1          ; 0 = 完全跳过 fs 编码补丁（其余 sys-patch 补丁照常）→ 救砖
+fs_codepage=1          ; 0 = 完全跳过 fs 编码补丁 → 救砖
 ```
 
 **没有任何条目级开关**：条目一律全量应用，补丁只有「整份生效 / 整份跳过」两态。
@@ -271,12 +298,18 @@ fs_codepage=1          ; 0 = 完全跳过 fs 编码补丁（其余 sys-patch 补
 FAT32 建 CJK 名会在 `FAT_MakeShortName` 的 `subs w23,w23,#2` 上死循环。
 （`stage_idx` 与 `needs_wide_cmp` 两个开关都在 2026-09-20 移除。）
 
-日志（`/config/sys-patch/log.ini`）关键字段：`[debug] fs_codepage`（附加前写入的 start 标记）、
-`[debug] fs_codepage_patch_result`（最后到达的组名 / 失败原因 / `success`）、
-`[debug] fs_codepage_unmatched`（未命中条目数）、`[fs_codepage]`（**只列已定位**的条目及其结果，
-失败项在此显现）、`[fs_codepage_sites]`（每个命中站点相对模块基址的偏移）。
-早期用于诊断的 `[debug] tmp_buffer` / `tmp_addr` / `tmp_size` 三项已于 2026-09-20 删除
-（基址仍在内存里用于换算站点偏移，只是不再落盘）。
+日志（`/config/fs-codepage/log.ini`）关键字段：`[debug] fs_codepage_phase`（挂死定位标记：
+附加前写 `attaching`，收尾落盘时覆写为 `done`；停在 `attaching` 且无 `fs_codepage_patch_result`
+行 = 挂死/崩溃在补丁流程内）、
+`[debug] fs_codepage_patch_result`（最终结论：`success` / 失败原因；挂死时日志写不出来，
+该值停在最后一个进入的函数组名上）、
+`[fs_codepage]`（**只列已定位**的条目及其结果，失败项在此显现）、
+`[fs_codepage_missing]`（**整族缺席**的补丁点：键 = 族名（功能前缀），值 = 该族仍 NOT_FOUND 的变体数）、
+`[debug] fs_codepage_missing_families`（缺席族数，**期望 0**；0 = 全部补丁点已落地）、
+`[fs_codepage_sites]`（每个命中站点相对模块基址的偏移）。
+未命中**不逐条列也不给总数**：大部分条目是跨版本互斥变体，一份固件上本就该 0 命中，
+逐条/计数会被误读成「补丁没打全」（以族为单位汇报，取代早先的
+`[debug] fs_codepage_unmatched` 条目计数）。
 
 **铁律**：`svcDebugActiveProcess()` 之后目标进程（fs）处于挂起状态，**此时不能写日志/SD**
 （必经 fs 服务）→ 会永久阻塞、开机卡 logo。进度只能先记内存、脱附后再落盘。
@@ -336,8 +369,8 @@ FAT32 建 CJK 名会在 `FAT_MakeShortName` 的 `subs w23,w23,#2` 上死循环�
 3. **FAT32 8.3 短名**：`R2` 只是把宽度钳到 2 避免死循环，短名空间估算仍按 CP932 行为；
    若要 PC 侧正确识别短名，可选"方案 C"（仅 `FAT_MakeShortName` 输出 GBK 短名，远期）。
 4. **半角片假名**：CP932↔UTF-8 round-trip 会丢失（历史方案已记录，属已知取舍）。
-5. **换固件版本**：全部改点已 pattern 化，**定位无需重推**（模板在 **26 份**变体上验证通过：
-   16.1.0–22.5.0 共 22 份 + 14.1.2/15.0.1 共 4 份）。
+5. **换固件版本**：全部改点已 pattern 化，**定位无需重推**（模板在支持范围内的全语料上
+   验证通过）。
    仍需重推的只有**收割类**事实：ctx 槽 / 外部 callee 的**原始编码**（由 `fs_harvest_*` 运行时解出，
    离线复核脚本 `_audit/_m6_harvest_check.py` 覆盖）；以及 guard 里 `FUNCTIONS` 表的**洞尺寸**。
 
@@ -354,22 +387,24 @@ make check-patch-sizes
 #   FS_KIP1=<path/19.exfat.FS.kip1> make check-patch-sizes   # 附带 cmp 字节比对
 
 # 3) 离线验证（脚本在 D:/Game/NS/firmware/_audit/，用 managed venv 的 python）
-python _verify_cpp_table.py     # 表 == PATTERNS.json（31 条）+ 364/364 站点 == RESOLVED
-python _p1_sim_scan.py          # 端到端：26/26 份固件，命中集合/站点/写入次数一致
-python _opt_equiv.py            # 扫描优化（车道筛子/兄弟退役/空转退出）新旧算法等价：26/26 一致
+#    ⚠️ 下列脚本是 2026-09/10 的历史验证记录，跑在**当时的语料**上（脚本名后的分数是那一次的
+#    结果，不是当前语料的重跑结果）。当前语料下的等价性检查用仓库内的
+#    `scripts/fs_version_matrix.py --min 10.0.0 --variant both`（0 问题 + 每份固件全部族覆盖）。
+python _verify_cpp_table.py     # 表 == PATTERNS.json + 站点 == RESOLVED
+python _p1_sim_scan.py          # 端到端：命中集合/站点/写入次数一致
+python _opt_equiv.py            # 扫描优化（车道筛子/兄弟退役/空转退出）新旧算法等价
 python _m6_sem_diff.py          # M6 行为级差分：基线 = 原版 0 补丁，穷举短串空间逐例比对
 python _m6_fold_probe.py        # M6 ASCII 折叠定点探针：12/12 与原版 0 补丁一致
-python _m6_oracle.py            # M6 unicorn 抽样差分：3 形状 × 3000 = 9000/9000（基线 = 旧 15 点补丁集）
+python _m6_oracle.py            # M6 unicorn 抽样差分：3 形状 × 3000（基线 = 旧 15 点补丁集）
                                 # M8 同口径：见 _m8_diff*.log（5 形状 × 2000 = 10000/10000）
-python _m6_harvest_check.py     # M6 定位 + ctx/callee 收割 + 地址重编码往返：26/26 通过
+python _m6_harvest_check.py     # M6 定位 + ctx/callee 收割 + 地址重编码往返
 
 # 3b) 固件适配审计（scripts/fs_fw_audit.py；表解析口径 = C++ str2hex 的逐字符）
 python fs_fw_audit.py check --fs <FS_unc.kip1>    # 逐点：同址 / 漂移 / cmp 指纹
-python fs_fw_audit.py holes --fs <FS_unc.kip1>    # 七个替换点的洞与余量
-#   19.0.1 复验：exfat(081b) 14/14 同址、cmp 14/14；fat32(0819) 14/14 块漂移、cmp 14/14
-#   （每份固件只有 14 个点存在 —— 变体族兄弟 0 命中属正常）
+python fs_fw_audit.py holes --fs <FS_unc.kip1>    # 各替换点的洞与余量
+#   复验口径：每份固件上「每个补丁点恰好同址一条」—— 变体族兄弟 0 命中属正常
 
-# 4) 部署：拷贝 exefs.nsp 到 SD 的 atmosphere/contents/420000000000000B/
+# 4) 部署：拷贝 out/atmosphere/ 到 SD 卡根
 # 5) 上机检查 log.ini 的 [debug] fs_codepage_patch_result 应为 success
 ```
 
@@ -384,12 +419,12 @@ python fs_fw_audit.py holes --fs <FS_unc.kip1>    # 七个替换点的洞与余�
 |---|---|
 | fs 镜像基址（分析用） | `0x7100000000`（**运行时随机，勿写死**） |
 | fs 文件偏移换算 | 文件偏移 = `0x100 + (VA − 0x7100000000)` |
-| 代码页上下文 GOT 槽（分析用，**已不写死**） | 19.exfat = `fs + 0x24EB50`；26 份实测 **18 个取值**（16.1.0=0x2797D0、17.0.0=0x23BE90、18.x=0x23D138、19.0.1/fat32=0x240B50、20.x=0x263F40、21.x=0x25CBC8、22.x=0x25FC38）⇒ 运行时由 `fs_harvest_ctx_slot()` 从原函数现场收割 |
+| 代码页上下文 GOT 槽（分析用，**已不写死**） | 19.exfat = `fs + 0x24EB50`；实测 **18 个取值**（16.1.0=0x2797D0、17.0.0=0x23BE90、18.x=0x23D138、19.0.1/fat32=0x240B50、20.x=0x263F40、21.x=0x25CBC8、22.x=0x25FC38）⇒ 运行时由 `fs_harvest_ctx_slot()` 从原函数现场收割，并由 `fs_verify_ctx_chain()` 复核指针链 |
 | per-char 回调槽 | 上下文 `+0x18`(OEM2Uni) `+0x20`(Uni2OEM) `+0x30`(isOEMMBchar) |
 | 模式标志 | 上下文 `+0x48` bit1 = 特殊映射模式 |
 | 补齐函数返回值约定 | 高 16 位 = 输出字节数；低 16 位 = 输入字节数 |
-| 七个替换函数尺寸（B / 洞） | 236/0x170 · 140/0x1D0 · **72**/0x50（余 8） · 236/0x120 · 148/0xB0 · **776**/0x360（M6，余 88） · 488/0x240（M8，余 88） |
-| 表规模 | `fs_fn_groups[12]` + `fs_inst_patches[15]` + `fs_blob_patches[17]`（= 32 条），谓词 **5**，覆盖 **14 个补丁点 / 12.0.0–22.5.0 全部 45 个小版本语料**；每份固件落地 14 条 |
+| 替换函数尺寸（B / 洞） | 236/0x170 · 140/0x1D0 · **72**/0x50（余 8） · 236/**0x110** · 148/0xB0 · **776**/0x360（M6，余 88） · 488/0x240（M8，余 88） |
+| 表规模怎么查 | `scripts/fs_version_matrix.py --min 10.0.0 --variant both`（条目/族/覆盖）；构建期守卫也会打印表规模与各替换体尺寸。**数字不入文档** —— 加条目后重跑即可 |
 | M6 定位模板 | `fs_cp_widechar_compare_{17.0.0+,16.0.0-16.1.0,12.0.0-14.1.2,15.0.0-15.0.1}` 四条入口对齐模板，入口 = 实测 `0xF4770` |
 | M8 定位模板 | `fs_cp_fat_getnextchar_16.0.0+` / `_12.0.0-15.0.1`，入口 = 实测 `0xF44E0` |
 

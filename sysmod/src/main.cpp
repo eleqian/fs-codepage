@@ -1,28 +1,19 @@
 // ============================================================================
-// fs-codepage -- standalone system module applying ONLY the fs codepage patch
-// (CP932 -> UTF-8, Chinese/UTF-8 filenames on FAT/exFAT), extracted from the
-// sys-patch fork so it can run next to the ORIGINAL (upstream) sys-patch.
+// fs-codepage —— 独立系统模块，只应用 fs codepage 补丁
+// （CP932 -> UTF-8，让 FAT/exFAT 支持中文/UTF-8 文件名）。
+// 基于 sys-patch 框架实现，可与 sys-patch 并存安装。
 //
-// Everything patch-related lives in fs_codepage.cpp (copied verbatim from the
-// sys-patch fork); this file is just the module skeleton: config, scheduling,
-// logging.
+// 补丁相关实现全部在 fs_codepage.cpp；本文件只是模块骨架：配置、调度、日志。
 //
-// Coexistence with sys-patch:
-//   * Patch sites are disjoint: upstream sys-patch's fs entries
-//     (noacidsigchk / noncasigchk / nocntchk) touch other functions, this
-//     module only touches the codepage conversion routines.
-//   * The one shared resource is the fs DEBUGGER (svcDebugActiveProcess is
-//     exclusive). Both modules run once at boot, so whoever loses the race
-//     must back off and retry. fs_codepage_patch() resets all of its state on
-//     entry and leaves fs_codepage_patch_result at "start" when fs was not
-//     found, which is the retry criterion used below.
-//   * Do NOT also enable the codepage patch inside a sys-patch build that has
-//     it (fork builds): pick one, via [options] fs_codepage=0 in the
-//     sys-patch config. Running both is fail-safe (the second scan finds the
-//     sites already rewritten and matches nothing) but pointless noise.
+// 与 sys-patch 并存的三个前提：
+//   * 补丁位点不相交：sys-patch 的 fs 条目改的是别的函数，
+//     本模块只动 codepage 转换例程。
+//   * 唯一共享资源是 fs 调试器（svcDebugActiveProcess 互斥）。
+//     两个模块都在开机时跑一次，竞争输家必须退避重试。
+//     fs_codepage_patch() 每次进入都会重置全部状态，
+//     找不到 fs 时 fs_codepage_patch_result 停在 "start" —— 这就是下面的重试判据。
 //
-// Config / log live under /config/fs-codepage/ -- deliberately NOT
-// /config/sys-patch/ so the two modules never touch each other's files.
+// 配置/日志在 /config/fs-codepage/ 下。
 // ============================================================================
 
 #include <cstring>
@@ -32,13 +23,13 @@
 
 namespace {
 
-constexpr u64 INNER_HEAP_SIZE = 0x1000; // same budget as sys-patch
+constexpr u64 INNER_HEAP_SIZE = 0x1000;
 
 constexpr auto MODULE_VERSION = "v1.0.0";
 
-u32 FW_VERSION{}; // set on startup (log diagnostics only)
+u32 FW_VERSION{}; // 启动时设置（仅日志诊断用）
 
-// 退避重试：原版 sys-patch 开机也会附加 fs 调试（互斥），输家等它脱附。
+// 退避重试： sys-patch 开机也会附加 fs 调试（互斥），输家等它脱附。
 // 25 次 x 200ms = 最长等 5s，足够覆盖 sys-patch 的整个补丁流程（实测亚秒级）。
 constexpr u32 ATTACH_ATTEMPTS = 25;
 constexpr u64 ATTACH_RETRY_MS = 200;
@@ -52,7 +43,7 @@ void smcAmsGetEmunandConfig(EmummcPaths* out_paths) {
     SecmonArgs args{};
     args.X[0] = 0xF0000404; /* smcAmsGetEmunandConfig */
     args.X[1] = 0; /* EXO_EMUMMC_MMC_NAND*/
-    args.X[2] = (u64)out_paths; /* out path */
+    args.X[2] = (u64)out_paths; /* 输出路径 */
     svcCallSecureMonitor(&args);
 }
 
@@ -62,7 +53,7 @@ auto is_emummc() -> bool {
     return (paths.unk[0] != '\0') || (paths.nintendo[0] != '\0');
 }
 
-// creates a directory, non-recursive!
+// 建目录，非递归！
 auto create_dir(const char* path) -> bool {
     Result rc{};
     FsFileSystem fs{};
@@ -78,7 +69,7 @@ auto create_dir(const char* path) -> bool {
     return R_SUCCEEDED(rc);
 }
 
-// same as ini_get but writes out the default value instead
+// 同 ini_get，但键不存在时把默认值写回文件
 auto ini_load_or_write_default(const char* section, const char* key, long _default, const char* path) -> long {
     if (!ini_haskey(section, key, path)) {
         ini_putl(section, key, _default, path);
@@ -88,7 +79,7 @@ auto ini_load_or_write_default(const char* section, const char* key, long _defau
     }
 }
 
-// eg, 852481 -> 13.2.1
+// 例：852481 -> 13.2.1
 void version_to_str(char* s, u32 ver) {
     const auto num_2_str = [&s](u16 num) {
         u16 mv = 100;
@@ -127,12 +118,11 @@ int main(int argc, char* argv[]) {
     create_dir("/config/fs-codepage/");
     ini_remove(log_path);
 
-    // load options
+    // 读配置
     const auto patch_sysmmc = ini_load_or_write_default("options", "patch_sysmmc", 1, ini_path);
     const auto patch_emummc = ini_load_or_write_default("options", "patch_emummc", 1, ini_path);
     const auto enable_logging = ini_load_or_write_default("options", "enable_logging", 1, ini_path);
     // 整份开关（唯一开关，没有逐点分级）：置 0 完全跳过，用于排障/救砖。
-    // 与 fork sys-patch 的 [options] fs_codepage 同名同义。
     const auto fs_codepage_enabled = ini_load_or_write_default("options", "fs_codepage", 1, ini_path);
 
     const auto emummc = is_emummc();
@@ -150,17 +140,21 @@ int main(int argc, char* argv[]) {
     if (enable_patching) {
         if (fs_codepage_enabled) {
             // 版本下限门控：补丁表按实测只覆盖 ≥ 10.0.0；更老的 fs 是更早的代码生成，
-            // 会出现「部分条目命中、部分不命中」的半成品（FAT_MakeShortName 宽度钳制与
-            // 转换器不成对 ⇒ 建 CJK 名时死循环）。FW_VERSION 取不到时为 0 —— 必须放行
+            // 会出现「部分条目命中、部分不命中」的半成品
+            // （FAT_MakeShortName 宽度钳制与转换器不成对 ⇒ 建 CJK 名时死循环）。
+            // FW_VERSION 取不到时为 0 —— 必须放行
             // （setsys 失败不应让补丁静默失效），命中判定交给 pattern 扫描兜底。
             if (FW_VERSION != 0 && FW_VERSION < MAKEHOSVERSION(10, 0, 0)) {
                 fs_codepage_patch_result = "unsupported_fw_version";
             } else {
-            // 附加调试进程后 fs 会被挂起，此后不能再写日志，所以先落一条标记
+            // 挂死定位标记：附加调试进程后 fs 会被挂起、写不了日志，所以进入补丁流程前
+            // 先落 "attaching"。补丁收尾落盘时（fs_codepage_write_log）会把它覆写成
+            // "done" —— 日志里它停在 "attaching" 且没有 fs_codepage_patch_result 行，
+            // 才说明挂死/崩溃在补丁流程内；成功时两行都在，不会误读成「卡在启动」。
             if (enable_logging) {
-                ini_puts("debug", "fs_codepage", "start", log_path);
+                ini_puts("debug", "fs_codepage_phase", "attaching", log_path);
             }
-            // 竞争退避：fs_codepage_patch() 找不到 fs（调试器被 sys-patch 占用，
+            // 竞争退避：fs_codepage_patch() 找不到 fs（调试器被其它补丁模块占用，
             // 或进程表读取失败）时 patch_result 停在 "start"，此时重跑是安全的
             // —— 它每次进入都会重置族表/车道/站点 sink。
             for (u32 attempt = 0; attempt < ATTACH_ATTEMPTS; attempt++) {
@@ -193,39 +187,39 @@ int main(int argc, char* argv[]) {
         fs_codepage_write_log(log_path);
     }
 
-    // note: sysmod exits here.
+    // 注：系统模块返回即退出。
     return 0;
 }
 
-// libnx stuff goes below
+// 以下是 libnx 固定样板
 extern "C" {
 
-// Sysmodules should not use applet*.
+// 系统模块不得使用 applet*。
 u32 __nx_applet_type = AppletType_None;
 
-// Sysmodules will normally only want to use one FS session.
+// 系统模块通常只需要一个 FS 会话。
 u32 __nx_fs_num_sessions = 1;
 
-// Newlib heap configuration function (makes malloc/free work).
+// newlib 堆配置函数（让 malloc/free 可用）。
 void __libnx_initheap(void) {
     static char inner_heap[INNER_HEAP_SIZE];
     extern char* fake_heap_start;
     extern char* fake_heap_end;
 
-    // Configure the newlib heap.
+    // 配置 newlib 堆。
     fake_heap_start = inner_heap;
     fake_heap_end   = inner_heap + sizeof(inner_heap);
 }
 
-// Service initialization.
+// 服务初始化。
 void __appInit(void) {
     Result rc{};
 
-    // Open a service manager session.
+    // 打开服务管理器会话。
     if (R_FAILED(rc = smInitialize()))
         fatalThrow(rc);
 
-    // Retrieve the current version of Horizon OS (log diagnostics only).
+    // 获取当前系统版本（仅日志诊断用）。
     if (R_SUCCEEDED(rc = setsysInitialize())) {
         SetSysFirmwareVersion fw{};
         if (R_SUCCEEDED(rc = setsysGetFirmwareVersion(&fw))) {
@@ -238,11 +232,11 @@ void __appInit(void) {
     if (R_FAILED(rc = fsInitialize()))
         fatalThrow(rc);
 
-    // Close the service manager session.
+    // 关闭服务管理器会话。
     smExit();
 }
 
-// Service deinitialization.
+// 服务反初始化。
 void __appExit(void) {
     fsExit();
 }
