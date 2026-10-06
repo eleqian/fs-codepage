@@ -55,9 +55,11 @@ IMAGE_BASE = 0x7100000000
 #   hole_src   -- 空洞依据（Ghidra 函数边界，改 fs 目标固件版本时必须重推）
 FUNCTIONS = [
     dict(symbol="patch_utf8_to_utf16", end_symbol="patch_utf8_to_utf16_end",
-         site=0xFEAC0, hole=0x170,
+         site=0xFEAC0, hole=0x150,
          site_name="PFCODE_CP932_OEM2Unicode",
-         hole_src="next function 0x71000fec30 (PFCODE_CP932_Unicode2OEM)"),
+         hole_src="next function 0x71000fec30 (PFCODE_CP932_Unicode2OEM)；"
+                  "相邻补丁点的入口间距才是硬判据：21.0.0/0819 与 23.0.0（0819/081b）"
+                  "上都只有 0x150，比 19.exfat 的 0x170 更紧 ⇒ 取全语料最小值 0x150"),
     dict(symbol="patch_utf16_to_utf8", end_symbol="patch_utf16_to_utf8_end",
          site=0xFEC30, hole=0x1D0,
          site_name="PFCODE_CP932_Unicode2OEM",
