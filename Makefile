@@ -9,6 +9,10 @@ TARGETS		:= $(foreach dir,$(MAKEFILES),$(CURDIR)/$(dir))
 all: $(TARGETS)
 	@mkdir -p out/
 	@cp -R sysmod/out/* out/
+	# Mirror contents/ wholesale instead of merging: a TID change would otherwise
+	# leave the previous contents/<tid>/ behind, shipping two sysmodule directories.
+	@rm -rf out/atmosphere/contents
+	@cp -R sysmod/out/atmosphere/contents out/atmosphere/contents
 
 $(TARGETS):
 	@$(MAKE) -C $@

@@ -109,8 +109,12 @@ endif
 
 #---------------------------------------------------------------------------------
 # install layout: atmosphere/contents/<TID>/{exefs.nsp,toolbox.json,flags/boot2.flag}
+#
+# 0x4200 prefix = homebrew sysmodule range. The low 32 bits are the ASCII
+# "fscp" (fs codepage patch), so the SD directory name identifies the module at
+# a glance and does not collide with sys-patch (0x420000000000000B).
 #---------------------------------------------------------------------------------
-TITLE_ID := 42000000000000E0
+TITLE_ID := 4200000066736370
 
 #---------------------------------------------------------------------------------
 # python (用于构建守卫与 dist 打包；msys2 无 zip 命令)

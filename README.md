@@ -43,7 +43,7 @@ Switch 大气层系统模块：把文件系统驱动 `fs` 的 CP932（日文）�
 解压 `fs-codepage-sysmodule.zip`，拷至 SD 卡根目录：
 
 ```
-SD:/atmosphere/contents/42000000000000E0/
+SD:/atmosphere/contents/4200000066736370/
 ├── exefs.nsp
 ├── toolbox.json
 └── flags/boot2.flag
@@ -102,10 +102,7 @@ make check-patch-sizes   # 只跑守卫
 make clean
 ```
 
-产物：`out/atmosphere/contents/42000000000000E0/{exefs.nsp, toolbox.json, flags/boot2.flag}`。
-
-> 与其它自制模块 Title ID 冲突时，修改 `sysmod/fs-codepage.json`、`sysmod/toolbox.json`
-  与 `sysmod/Makefile` 的 `TITLE_ID` 三处后重新构建。
+产物：`out/atmosphere/contents/4200000066736370/{exefs.nsp, toolbox.json, flags/boot2.flag}`。
 
 **构建期守卫**（`scripts/check_patch_sizes.py`，每次构建自动运行，任一失败即构建失败）：
 
@@ -127,7 +124,7 @@ python scripts/fs_version_matrix.py --min 10.0.0 --variant both
 Makefile                      根：只管 sysmod，产物收集到 out/
 common/minIni/                INI 库
 sysmod/
-  Makefile                    TARGET=fs-codepage, TITLE_ID=42000000000000E0
+  Makefile                    TARGET=fs-codepage, TITLE_ID=4200000066736370
   fs-codepage.json            权限声明（NPDM）
   toolbox.json                Toolbox 列表项
   src/main.cpp                骨架：配置、调度、日志

@@ -380,7 +380,7 @@ FAT32 建 CJK 名会在 `FAT_MakeShortName` 的 `subs w23,w23,#2` 上死循环�
 
 ```bash
 # 1) 构建（自动跑守卫）
-make                     # DEVKITPRO 需设置；产物 out/atmosphere/contents/420000000000000B/exefs.nsp
+make                     # DEVKITPRO 需设置；产物 out/atmosphere/contents/4200000066736370/exefs.nsp
 
 # 2) 单独跑守卫
 make check-patch-sizes
