@@ -7,6 +7,8 @@ Switch 大气层系统模块：把文件系统驱动 `fs` 的 CP932（日文）�
 [![Corpus](https://img.shields.io/badge/verified-full%20corpus-3c7abf?style=flat-square)](scripts/fs_version_matrix.py)
 [![Build](https://img.shields.io/badge/build-guard%20enforced-3c7abf?style=flat-square)](scripts/check_patch_sizes.py)
 
+![中文文件名示例](doc/psp.jpg)
+
 基于 sys-patch 框架实现，与 sys-patch **可并存安装**（打补丁的函数不相关）。
 
 ---
